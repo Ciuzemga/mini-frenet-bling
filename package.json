@@ -1,6 +1,6 @@
 {
-  "name": "ciuzelog-v5-final-fiel",
-  "version": "5.0.0-final-profissional-fiel",
+  "name": "ciuzelog-v6-allpost-frenet",
+  "version": "6.0.0-allpost-frenet-profissional",
   "type": "module",
   "main": "server.js",
   "scripts": {
@@ -12,6 +12,7 @@
     "@fastify/multipart": "^8.3.0",
     "pg": "^8.11.3",
     "dotenv": "^16.4.5",
+    "bcryptjs": "^2.4.3",
     "xlsx": "^0.18.5"
   },
   "engines": {
