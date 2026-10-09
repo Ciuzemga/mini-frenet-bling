@@ -65,11 +65,13 @@ async function initDB(){
       taxa_min NUMERIC,
       taxa_max NUMERIC,
       taxa_perc NUMERIC,
-      created_at TIMESTAMP DEFAULT NOW()
+      created_at TIMESTAMP DEFAULT NOW(),
+      updated_at TIMESTAMP DEFAULT NOW()
     );
   `);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_frete_transp ON frete_tabelas(transportadora);`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_frete_cep ON frete_tabelas(cep_ini, cep_fim);`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_frete_peso ON frete_tabelas(peso_ini, peso_fim);`);
   console.log('DB pronto');
   DB_READY = true;
   }catch(e){ console.error('DB init falhou:', e.message); }
@@ -148,6 +150,15 @@ function parseTabelaFromRows(rows, forcedTransportadora=null){
   return data;
 }
 
+function parseTabelaXLSX(buffer, forcedTransportadora=null){
+  const wb = XLSX.read(buffer, {type:'buffer'});
+  const firstSheet = wb.SheetNames[0];
+  const ws = wb.Sheets[firstSheet];
+  const json = XLSX.utils.sheet_to_json(ws, {defval:0});
+  if(json.length===0) return [];
+  return parseTabelaFromRows(json, forcedTransportadora);
+}
+
 function parseTabelaHTML(html, forcedTransportadora=null){
   const rowRegex = /<tr[^>]*>(.*?)<\/tr>/gis;
   const colRegex = /<t[dh][^>]*>(.*?)<\/t[dh]>/gis;
@@ -192,15 +203,6 @@ function parseTabelaHTML(html, forcedTransportadora=null){
   })), forcedTransportadora);
 }
 
-function parseTabelaXLSX(buffer, forcedTransportadora=null){
-  const wb = XLSX.read(buffer, {type:'buffer'});
-  const firstSheet = wb.SheetNames[0];
-  const ws = wb.Sheets[firstSheet];
-  const json = XLSX.utils.sheet_to_json(ws, {defval:0});
-  if(json.length===0) return [];
-  return parseTabelaFromRows(json, forcedTransportadora);
-}
-
 function parseTabela(buffer, filename='', forcedTransportadora=null){
   const name = (filename||'').toLowerCase();
   const isZip = buffer[0]===0x50 && buffer[1]===0x4B;
@@ -214,19 +216,6 @@ function parseTabela(buffer, filename='', forcedTransportadora=null){
   const html = buffer.toString('utf-8');
   if(html.includes('<tr') || html.includes('<TR')){
     return parseTabelaHTML(html, forcedTransportadora);
-  }
-  if(html.includes(';') || html.includes(',')){
-    const lines = html.split(/\r?\n/).filter(l=>l.trim());
-    if(lines.length>1){
-      const headers = lines[0].split(/;|,/).map(h=>h.trim());
-      const rows = lines.slice(1).map(l=>{
-        const vals = l.split(/;|,/);
-        const obj={};
-        headers.forEach((h,i)=>obj[h]=vals[i]);
-        return obj;
-      });
-      return parseTabelaFromRows(rows, forcedTransportadora);
-    }
   }
   return [];
 }
@@ -265,7 +254,7 @@ async function getTabelas(force=false){
   let rows;
   if(pool){
     await ensureDB();
-    try{ const res=await pool.query('SELECT * FROM frete_tabelas ORDER BY transportadora, cep_ini'); rows=res.rows; }
+    try{ const res=await pool.query('SELECT * FROM frete_tabelas ORDER BY transportadora, cep_ini, peso_ini'); rows=res.rows; }
     catch(e){ if(CACHE_TABELAS) rows=CACHE_TABELAS; else throw Object.assign(new Error('banco indisponivel'),{statusCode:503}); }
   } else { global.TABELAS_MEM=global.TABELAS_MEM||[]; rows=global.TABELAS_MEM; }
   CACHE_TABELAS=rows; CACHE_AT=now; return rows;
@@ -276,17 +265,20 @@ async function getResumoTransportadoras(){
   const map={};
   for(const t of tabelas){
     const key = (t.transportadora||'CIUZE').toUpperCase();
-    if(!map[key]) map[key]={transportadora:key, total:0, metodos:new Set(), prazoMin:999, prazoMax:0, updated: t.created_at};
+    if(!map[key]) map[key]={transportadora:key, total:0, metodos:new Set(), prazoMin:999, prazoMax:0, updated: t.created_at, updated_at: t.updated_at};
     map[key].total++;
     map[key].metodos.add(t.metodo);
     const prazo=toNum(t.prazo);
     if(prazo>0){ map[key].prazoMin=Math.min(map[key].prazoMin,prazo); map[key].prazoMax=Math.max(map[key].prazoMax,prazo); }
+    if(t.updated_at && (!map[key].updated_at || t.updated_at>map[key].updated_at)) map[key].updated_at=t.updated_at;
     if(t.created_at && (!map[key].updated || t.created_at>map[key].updated)) map[key].updated=t.created_at;
   }
   return Object.values(map).map(m=>({...m, metodos:[...m.metodos], prazoMin: m.prazoMin===999?5:m.prazoMin}));
 }
 
 const num = (v,d)=>{ const n=parseFloat(v); return Number.isFinite(n)?n:d; };
+
+// ROTAS
 
 app.post('/api/cotacao', async (req, reply)=>{
   const body=req.body||{};
@@ -341,23 +333,16 @@ app.post('/api/upload', async (req, reply)=>{
   let forcedTransp = null;
   const file = await req.file();
   if(!file) return reply.code(400).send({ erro: 'arquivo ausente. Envie como multipart field file' });
-
-  if(file.fields && file.fields.transportadora){
-    forcedTransp = file.fields.transportadora.value;
-  }
+  if(file.fields && file.fields.transportadora){ forcedTransp = file.fields.transportadora.value; }
   if(!forcedTransp && req.headers['x-transportadora']) forcedTransp = req.headers['x-transportadora'];
   if(!forcedTransp && req.query && req.query.transportadora) forcedTransp = req.query.transportadora;
-
   if(!forcedTransp) return reply.code(400).send({ erro: 'Informe o nome da transportadora. Campo transportadora é obrigatório.' });
-
   forcedTransp = String(forcedTransp).toUpperCase().trim();
   if(forcedTransp.length < 2) return reply.code(400).send({ erro: 'Nome da transportadora muito curto' });
-
   const buffer = await file.toBuffer();
   const filename = file.filename || '';
   const parsed = parseTabela(buffer, filename, forcedTransp);
   if(parsed.length===0) return reply.code(400).send({ erro: 'Nenhuma linha valida encontrada. Verifique a planilha. Formatos: .xlsx, .xls, .html, .htm' });
-
   if(pool){
     let client;
     try{ await ensureDB(); client=await pool.connect(); }catch(e){ return reply.code(503).send({ erro:'banco indisponivel', detalhe:e.message }); }
@@ -379,17 +364,7 @@ app.post('/api/upload', async (req, reply)=>{
     CACHE_TABELAS = global.TABELAS_MEM;
     CACHE_AT=Date.now();
   }
-  return { ok:true, transportadora:forcedTransp, total:parsed.length, mensagem: `Tabela ${forcedTransp} atualizada. ${parsed.length} regras. Anterior removida para economizar espaço.`, preview: parsed.slice(0,3) };
-});
-
-app.get('/api/tabelas', async (req, reply)=>{
-  const token = req.headers['x-upload-token'];
-  if(!process.env.UPLOAD_TOKEN || token !== process.env.UPLOAD_TOKEN) return reply.code(401).send({ erro:'nao autorizado' });
-  try{
-    const resumo = await getResumoTransportadoras();
-    const tabelas = await getTabelas();
-    return { total: tabelas.length, transportadoras: resumo, tabelas: tabelas.slice(0,200) };
-  }catch(e){ return reply.code(503).send({ erro:'banco indisponivel' }); }
+  return { ok:true, transportadora:forcedTransp, total:parsed.length, mensagem: `Tabela ${forcedTransp} atualizada. ${parsed.length} regras.`, preview: parsed.slice(0,3) };
 });
 
 app.get('/api/transportadoras', async (req, reply)=>{
@@ -401,18 +376,176 @@ app.get('/api/transportadoras', async (req, reply)=>{
   }catch(e){ return reply.code(503).send({ erro:'banco indisponivel' }); }
 });
 
+app.get('/api/tabelas/:transportadora/linhas', async (req, reply)=>{
+  const token = req.headers['x-upload-token'];
+  if(!process.env.UPLOAD_TOKEN || token !== process.env.UPLOAD_TOKEN) return reply.code(401).send({ erro:'nao autorizado' });
+  const transp = (req.params.transportadora||'').toUpperCase().trim();
+  const page = parseInt(req.query.page)||1;
+  const limit = Math.min(parseInt(req.query.limit)||50, 200);
+  const buscaCep = req.query.cep ? parseInt(String(req.query.cep).replace(/\D/g,'')) : null;
+  const offset = (page-1)*limit;
+  if(pool){
+    await ensureDB();
+    let where='WHERE UPPER(transportadora)=UPPER($1)';
+    const params=[transp];
+    if(buscaCep){
+      where+=` AND cep_ini <= $${params.length+1} AND cep_fim >= $${params.length+1}`;
+      params.push(buscaCep);
+    }
+    const countRes = await pool.query(`SELECT COUNT(*) FROM frete_tabelas ${where}`, params);
+    const total = parseInt(countRes.rows[0].count);
+    const res = await pool.query(`SELECT * FROM frete_tabelas ${where} ORDER BY cep_ini, peso_ini LIMIT $${params.length+1} OFFSET $${params.length+2}`, [...params, limit, offset]);
+    return { transportadora: transp, total, page, limit, total_pages: Math.ceil(total/limit), linhas: res.rows };
+  } else {
+    let rows = (global.TABELAS_MEM||[]).filter(r=> (r.transportadora||'').toUpperCase()===transp);
+    if(buscaCep) rows = rows.filter(r=> buscaCep >= toNum(r.cep_ini) && buscaCep <= toNum(r.cep_fim));
+    const total = rows.length;
+    const linhas = rows.slice(offset, offset+limit);
+    return { transportadora: transp, total, page, limit, total_pages: Math.ceil(total/limit), linhas };
+  }
+});
+
+app.put('/api/tabelas/linha/:id', async (req, reply)=>{
+  const token = req.headers['x-upload-token'];
+  if(!process.env.UPLOAD_TOKEN || token !== process.env.UPLOAD_TOKEN) return reply.code(401).send({ erro:'nao autorizado' });
+  const id = parseInt(req.params.id);
+  const body = req.body||{};
+  const allowed = ['cep_ini','cep_fim','peso_ini','peso_fim','valor_ini','valor_fim','cubagem','limite_peso','prazo','frete_valor','excedente','advalor_perc','peso_excedente','valor_por_kg','despacho','total_minimo','imposto_perc','seguro_perc','seguro_min','gris_perc','gris_min','pedagio','pedagio_fracao','tas_perc','tas_min','emex_perc','emex_min','taxa_min','taxa_max','taxa_perc','metodo','transportadora'];
+  const sets=[];
+  const vals=[];
+  let idx=1;
+  for(const k of allowed){
+    if(body[k]!==undefined){
+      sets.push(`${k}=$${idx}`);
+      vals.push(k==='transportadora'||k==='metodo' ? String(body[k]).toUpperCase().trim() : body[k]);
+      idx++;
+    }
+  }
+  if(sets.length===0) return reply.code(400).send({ erro:'nenhum campo para atualizar' });
+  sets.push(`updated_at=NOW()`);
+  if(pool){
+    await ensureDB();
+    vals.push(id);
+    const res = await pool.query(`UPDATE frete_tabelas SET ${sets.join(', ')} WHERE id=$${idx} RETURNING *`, vals);
+    CACHE_TABELAS=null;
+    if(res.rows.length===0) return reply.code(404).send({ erro:'linha nao encontrada' });
+    return { ok:true, linha: res.rows[0] };
+  } else {
+    const mem = global.TABELAS_MEM||[];
+    const i = mem.findIndex(r=> r.id===id);
+    if(i===-1) return reply.code(404).send({ erro:'linha nao encontrada' });
+    for(const k of allowed){ if(body[k]!==undefined) mem[i][k]=body[k]; }
+    CACHE_TABELAS=mem;
+    return { ok:true, linha: mem[i] };
+  }
+});
+
+app.delete('/api/tabelas/linha/:id', async (req, reply)=>{
+  const token = req.headers['x-upload-token'];
+  if(!process.env.UPLOAD_TOKEN || token !== process.env.UPLOAD_TOKEN) return reply.code(401).send({ erro:'nao autorizado' });
+  const id = parseInt(req.params.id);
+  if(pool){
+    await ensureDB();
+    const res = await pool.query('DELETE FROM frete_tabelas WHERE id=$1', [id]);
+    CACHE_TABELAS=null;
+    return { ok:true, removidas: res.rowCount };
+  } else {
+    const antes = (global.TABELAS_MEM||[]).length;
+    global.TABELAS_MEM = (global.TABELAS_MEM||[]).filter(r=> r.id!==id);
+    CACHE_TABELAS=global.TABELAS_MEM;
+    return { ok:true, removidas: antes - CACHE_TABELAS.length };
+  }
+});
+
+app.post('/api/tabelas/:transportadora/linha', async (req, reply)=>{
+  const token = req.headers['x-upload-token'];
+  if(!process.env.UPLOAD_TOKEN || token !== process.env.UPLOAD_TOKEN) return reply.code(401).send({ erro:'nao autorizado' });
+  const transp = (req.params.transportadora||'').toUpperCase().trim();
+  const body = req.body||{};
+  if(!transp) return reply.code(400).send({ erro:'transportadora obrigatoria' });
+  const nova = {
+    transportadora: transp,
+    metodo: body.metodo||'Frete Peso',
+    cep_ini: parseInt(body.cep_ini)||0,
+    cep_fim: parseInt(body.cep_fim)||99999999,
+    peso_ini: parseFloat(body.peso_ini)||0,
+    peso_fim: parseFloat(body.peso_fim)||999,
+    valor_ini: parseFloat(body.valor_ini)||0,
+    valor_fim: parseFloat(body.valor_fim)||9999999,
+    cubagem: parseFloat(body.cubagem)||300,
+    limite_peso: parseFloat(body.limite_peso)||5000,
+    prazo: parseInt(body.prazo)||5,
+    frete_valor: parseFloat(body.frete_valor)||0,
+    excedente: parseFloat(body.excedente)||0,
+    advalor_perc: parseFloat(body.advalor_perc)||0,
+    peso_excedente: parseFloat(body.peso_excedente)||0,
+    valor_por_kg: parseFloat(body.valor_por_kg)||0,
+    despacho: parseFloat(body.despacho)||0,
+    total_minimo: parseFloat(body.total_minimo)||0,
+    imposto_perc: parseFloat(body.imposto_perc)||0,
+    seguro_perc: parseFloat(body.seguro_perc)||0,
+    seguro_min: parseFloat(body.seguro_min)||0,
+    gris_perc: parseFloat(body.gris_perc)||0,
+    gris_min: parseFloat(body.gris_min)||0,
+    pedagio: parseFloat(body.pedagio)||0,
+    pedagio_fracao: parseFloat(body.pedagio_fracao)||0,
+    tas_perc: parseFloat(body.tas_perc)||0,
+    tas_min: parseFloat(body.tas_min)||0,
+    emex_perc: parseFloat(body.emex_perc)||0,
+    emex_min: parseFloat(body.emex_min)||0,
+    taxa_min: parseFloat(body.taxa_min)||0,
+    taxa_max: parseFloat(body.taxa_max)||0,
+    taxa_perc: parseFloat(body.taxa_perc)||0,
+  };
+  if(pool){
+    await ensureDB();
+    const res = await pool.query(`INSERT INTO frete_tabelas (transportadora, metodo, cep_ini, cep_fim, peso_ini, peso_fim, valor_ini, valor_fim, cubagem, limite_peso, prazo, frete_valor, excedente, advalor_perc, peso_excedente, valor_por_kg, despacho, total_minimo, imposto_perc, seguro_perc, seguro_min, gris_perc, gris_min, pedagio, pedagio_fracao, tas_perc, tas_min, emex_perc, emex_min, taxa_min, taxa_max, taxa_perc) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32) RETURNING *`, [nova.transportadora, nova.metodo, nova.cep_ini, nova.cep_fim, nova.peso_ini, nova.peso_fim, nova.valor_ini, nova.valor_fim, nova.cubagem, nova.limite_peso, nova.prazo, nova.frete_valor, nova.excedente, nova.advalor_perc, nova.peso_excedente, nova.valor_por_kg, nova.despacho, nova.total_minimo, nova.imposto_perc, nova.seguro_perc, nova.seguro_min, nova.gris_perc, nova.gris_min, nova.pedagio, nova.pedagio_fracao, nova.tas_perc, nova.tas_min, nova.emex_perc, nova.emex_min, nova.taxa_min, nova.taxa_max, nova.taxa_perc]);
+    CACHE_TABELAS=null;
+    return { ok:true, linha: res.rows[0] };
+  } else {
+    const id = Date.now();
+    global.TABELAS_MEM = global.TABELAS_MEM||[];
+    const row = { id, ...nova };
+    global.TABELAS_MEM.push(row);
+    CACHE_TABELAS=global.TABELAS_MEM;
+    return { ok:true, linha: row };
+  }
+});
+
+app.post('/api/tabelas/:transportadora/reajuste', async (req, reply)=>{
+  const token = req.headers['x-upload-token'];
+  if(!process.env.UPLOAD_TOKEN || token !== process.env.UPLOAD_TOKEN) return reply.code(401).send({ erro:'nao autorizado' });
+  const transp = (req.params.transportadora||'').toUpperCase().trim();
+  const { percentual, campo } = req.body||{};
+  const perc = parseFloat(percentual);
+  if(!transp || isNaN(perc)) return reply.code(400).send({ erro:'transportadora e percentual obrigatorios' });
+  const campoAlvo = campo || 'frete_valor';
+  const allowed = ['frete_valor','excedente','valor_por_kg','pedagio','despacho','total_minimo'];
+  if(!allowed.includes(campoAlvo)) return reply.code(400).send({ erro:'campo invalido. Use: '+allowed.join(', ') });
+  const fator = 1 + perc/100;
+  if(pool){
+    await ensureDB();
+    const res = await pool.query(`UPDATE frete_tabelas SET ${campoAlvo}=${campoAlvo}*$1, updated_at=NOW() WHERE UPPER(transportadora)=UPPER($2)`, [fator, transp]);
+    CACHE_TABELAS=null;
+    return { ok:true, transportadora: transp, campo: campoAlvo, percentual: perc, afetadas: res.rowCount };
+  } else {
+    let afetadas=0;
+    (global.TABELAS_MEM||[]).forEach(r=>{ if((r.transportadora||'').toUpperCase()===transp){ r[campoAlvo]=toNum(r[campoAlvo])*fator; afetadas++; } });
+    CACHE_TABELAS=global.TABELAS_MEM;
+    return { ok:true, transportadora: transp, campo: campoAlvo, percentual: perc, afetadas };
+  }
+});
+
 app.delete('/api/tabelas/:transportadora', async (req, reply)=>{
   const token = req.headers['x-upload-token'];
   if(!process.env.UPLOAD_TOKEN || token !== process.env.UPLOAD_TOKEN) return reply.code(401).send({ erro:'nao autorizado' });
   const transp = (req.params.transportadora||'').toUpperCase().trim();
   if(!transp) return reply.code(400).send({ erro:'transportadora obrigatoria' });
   if(pool){
-    try{
-      await ensureDB();
-      const res = await pool.query('DELETE FROM frete_tabelas WHERE UPPER(transportadora)=UPPER($1)', [transp]);
-      CACHE_TABELAS=null;
-      return { ok:true, transportadora:transp, removidas: res.rowCount };
-    }catch(e){ return reply.code(500).send({ erro:e.message }); }
+    await ensureDB();
+    const res = await pool.query('DELETE FROM frete_tabelas WHERE UPPER(transportadora)=UPPER($1)', [transp]);
+    CACHE_TABELAS=null;
+    return { ok:true, transportadora:transp, removidas: res.rowCount };
   } else {
     const antes = (global.TABELAS_MEM||[]).length;
     global.TABELAS_MEM = (global.TABELAS_MEM||[]).filter(r=> (r.transportadora||'').toUpperCase() !== transp);
@@ -434,84 +567,166 @@ app.get('/painel', async (req, reply)=>{
 <html lang="pt-BR">
 <head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Mini-Frenet - Painel Completo</title>
+<title>Mini-Frenet - Painel Frenet-like</title>
 <script src="https://cdn.tailwindcss.com"></script>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
-<style>body{font-family:Inter,sans-serif}</style>
+<style>
+body{font-family:Inter,sans-serif}
+::-webkit-scrollbar{width:8px;height:8px}::-webkit-scrollbar-thumb{background:#3f3f46;border-radius:4px}
+.table-edit input{width:100%;background:#27272a;border:1px solid #3f3f46;border-radius:6px;padding:4px 6px;font-size:11px}
+.table-edit input:focus{border-color:#8b5cf6;outline:none}
+</style>
 </head>
 <body class="bg-[#0f0f10] text-white min-h-screen">
-<div class="max-w-7xl mx-auto p-4 md:p-8">
-  <div class="flex items-center justify-between mb-8">
+<div class="max-w-[1600px] mx-auto p-4 md:p-6">
+
+  <div class="flex items-center justify-between mb-6">
     <div class="flex items-center gap-3">
       <div class="w-10 h-10 rounded-xl bg-gradient-to-br from-violet-500 to-fuchsia-500 flex items-center justify-center font-bold">MF</div>
-      <div><h1 class="font-bold text-xl">Mini-Frenet</h1><p class="text-xs text-zinc-400">Painel Multi-Transportadora</p></div>
+      <div><h1 class="font-bold text-xl">Mini-Frenet</h1><p class="text-xs text-zinc-400">Painel Frenet-like • Edição por Faixa de CEP</p></div>
     </div>
-    <div id="statusBadge" class="px-3 py-1 rounded-full text-xs bg-zinc-800 text-zinc-400">Carregando...</div>
+    <div class="flex gap-2">
+      <div id="statusBadge" class="px-3 py-1 rounded-full text-xs bg-zinc-800 text-zinc-400">Carregando...</div>
+      <button onclick="copyLink()" class="text-xs bg-violet-600 hover:bg-violet-500 px-3 py-1 rounded-full">Link Bling</button>
+    </div>
   </div>
 
-  <div class="grid md:grid-cols-4 gap-4 mb-8">
-    <div class="bg-zinc-900 border border-zinc-800 rounded-2xl p-5"><p class="text-zinc-400 text-xs">Status DB</p><p id="dbStatus" class="text-lg font-semibold mt-1">-</p><p id="totalRegras" class="text-xs text-zinc-500 mt-1"></p></div>
-    <div class="bg-zinc-900 border border-zinc-800 rounded-2xl p-5"><p class="text-zinc-400 text-xs">Transportadoras</p><p id="totalTransp" class="text-lg font-semibold mt-1">-</p><p class="text-xs text-zinc-500 mt-1">cadastradas</p></div>
-    <div class="bg-zinc-900 border border-zinc-800 rounded-2xl p-5"><p class="text-zinc-400 text-xs">API Cotação</p><p class="text-sm font-mono mt-1 break-all">/api/cotacao</p><p class="text-xs text-green-400 mt-2">● 1 preço por transportadora</p></div>
-    <div class="bg-zinc-900 border border-zinc-800 rounded-2xl p-5"><p class="text-zinc-400 text-xs">Link Bling</p><button onclick="copyLink()" class="mt-2 text-xs bg-violet-600 hover:bg-violet-500 px-3 py-2 rounded-lg w-full">Copiar Link Bling</button><p id="copyMsg" class="text-xs text-green-400 mt-1 hidden">Copiado!</p></div>
+  <div class="grid md:grid-cols-4 gap-4 mb-6">
+    <div class="bg-zinc-900 border border-zinc-800 rounded-2xl p-4"><p class="text-zinc-400 text-xs">Status DB</p><p id="dbStatus" class="text-sm font-semibold mt-1">-</p><p id="totalRegras" class="text-xs text-zinc-500 mt-1"></p></div>
+    <div class="bg-zinc-900 border border-zinc-800 rounded-2xl p-4"><p class="text-zinc-400 text-xs">Transportadoras</p><p id="totalTransp" class="text-sm font-semibold mt-1">-</p><p class="text-xs text-zinc-500 mt-1">cadastradas</p></div>
+    <div class="bg-zinc-900 border border-zinc-800 rounded-2xl p-4"><p class="text-zinc-400 text-xs">API</p><p class="text-xs font-mono mt-1">/api/cotacao</p><p class="text-[11px] text-green-400 mt-1">1 preço por transp.</p></div>
+    <div class="bg-zinc-900 border border-zinc-800 rounded-2xl p-4"><p class="text-zinc-400 text-xs">Edição</p><p class="text-xs mt-1">Clique na transportadora para editar faixas de CEP</p></div>
   </div>
 
-  <div class="grid lg:grid-cols-5 gap-6">
-    <div class="lg:col-span-2 bg-zinc-900 border border-zinc-800 rounded-2xl p-6">
-      <h2 class="font-semibold mb-4">🔐 Acesso</h2>
-      <label class="text-xs text-zinc-400">Token UPLOAD_TOKEN</label>
-      <div class="flex gap-2 mt-1">
-        <input id="tokenInput" type="password" placeholder="Digite seu token" class="flex-1 bg-zinc-800 border border-zinc-700 rounded-xl px-4 py-2.5 text-sm outline-none focus:border-violet-500">
-        <button onclick="toggleToken()" class="px-3 bg-zinc-800 border border-zinc-700 rounded-xl text-xs">👁️</button>
-      </div>
-      <button onclick="salvarToken()" class="mt-3 w-full bg-zinc-800 hover:bg-zinc-700 border border-zinc-700 rounded-xl py-2.5 text-sm">Salvar Token</button>
-      <p id="tokenMsg" class="text-xs mt-2 hidden"></p>
-
-      <h3 class="font-semibold mt-8 mb-3">📤 Upload por Transportadora</h3>
-      <div class="bg-zinc-800/50 border border-zinc-700/50 rounded-xl p-4 mb-4">
-        <label class="text-xs text-zinc-300 font-semibold">Nome da Transportadora *</label>
-        <input id="transpInput" placeholder="Ex: BRASPRESS, JADLOG, CORREIOS, CIUZE" class="w-full mt-2 bg-zinc-900 border border-zinc-700 rounded-xl px-4 py-3 text-sm uppercase font-semibold tracking-wide outline-none focus:border-violet-500" oninput="this.value=this.value.toUpperCase()">
-        <p class="text-[11px] text-zinc-500 mt-2">Se já existir, a antiga é APAGADA e substituída (economiza espaço).</p>
-      </div>
-
-      <div id="dropZone" class="border-2 border-dashed border-zinc-700 rounded-2xl p-8 text-center hover:border-violet-500/50 transition cursor-pointer bg-zinc-800/30">
-        <div class="text-3xl mb-2">📄</div>
-        <p class="text-sm font-medium">Arraste a planilha aqui</p>
-        <p class="text-xs text-zinc-500 mt-1">.xlsx, .xls, .html, .htm</p>
-        <p class="text-xs text-zinc-600 mt-3">ou clique para selecionar</p>
-        <input id="fileInput" type="file" accept=".xlsx,.xls,.html,.htm" class="hidden">
-      </div>
-      <div id="uploadProgress" class="hidden mt-4"><div class="h-2 bg-zinc-800 rounded-full overflow-hidden"><div id="progressBar" class="h-full bg-violet-500 transition-all" style="width:0%"></div></div><p id="progressText" class="text-xs text-zinc-400 mt-2"></p></div>
-      <div id="uploadResult" class="hidden mt-4 p-4 rounded-xl text-sm"></div>
-    </div>
-
-    <div class="lg:col-span-3 space-y-6">
-      <div class="bg-zinc-900 border border-zinc-800 rounded-2xl p-6">
-        <div class="flex items-center justify-between mb-4">
-          <h3 class="font-semibold">🚚 Transportadoras Cadastradas</h3>
-          <button onclick="carregarTabelas()" class="text-xs bg-zinc-800 hover:bg-zinc-700 border border-zinc-700 px-3 py-2 rounded-lg">🔄 Atualizar</button>
+  <div class="grid lg:grid-cols-12 gap-6">
+    <div class="lg:col-span-4 space-y-4">
+      <div class="bg-zinc-900 border border-zinc-800 rounded-2xl p-5">
+        <h2 class="font-semibold mb-3 text-sm">🔐 Acesso</h2>
+        <div class="flex gap-2">
+          <input id="tokenInput" type="password" placeholder="Token" class="flex-1 bg-zinc-800 border border-zinc-700 rounded-xl px-3 py-2 text-sm outline-none focus:border-violet-500">
+          <button onclick="salvarToken()" class="bg-zinc-800 border border-zinc-700 rounded-xl px-3 text-xs">Salvar</button>
         </div>
-        <div id="transpLista" class="space-y-3"></div>
-        <div id="tabelasResumo" class="mt-4 text-xs text-zinc-500"></div>
+        <p id="tokenMsg" class="text-xs mt-2 hidden"></p>
+
+        <h3 class="font-semibold mt-6 mb-2 text-sm">📤 Upload por Transportadora</h3>
+        <div class="bg-zinc-800/50 border border-zinc-700/50 rounded-xl p-3 mb-3">
+          <input id="transpInput" placeholder="NOME TRANSPORTADORA" class="w-full bg-zinc-900 border border-zinc-700 rounded-xl px-3 py-2.5 text-sm uppercase font-semibold outline-none focus:border-violet-500" oninput="this.value=this.value.toUpperCase()">
+          <p class="text-[10px] text-zinc-500 mt-1">Ao subir de novo, apaga só essa.</p>
+        </div>
+        <div id="dropZone" class="border-2 border-dashed border-zinc-700 rounded-xl p-6 text-center hover:border-violet-500/50 cursor-pointer bg-zinc-800/30">
+          <p class="text-sm">Arraste a planilha</p>
+          <p class="text-[11px] text-zinc-500 mt-1">.xlsx .xls .html .htm</p>
+          <input id="fileInput" type="file" accept=".xlsx,.xls,.html,.htm" class="hidden">
+        </div>
+        <div id="uploadProgress" class="hidden mt-3"><div class="h-1.5 bg-zinc-800 rounded-full overflow-hidden"><div id="progressBar" class="h-full bg-violet-500 transition-all" style="width:0%"></div></div><p id="progressText" class="text-[11px] text-zinc-400 mt-1"></p></div>
+        <div id="uploadResult" class="hidden mt-3 p-3 rounded-xl text-xs"></div>
       </div>
 
-      <div class="bg-zinc-900 border border-zinc-800 rounded-2xl p-6">
-        <h3 class="font-semibold mb-4">🧪 Testar Cotação (Multi-Transportadora)</h3>
-        <div class="grid grid-cols-2 gap-3">
-          <div><label class="text-xs text-zinc-400">CEP Destino</label><input id="testCep" value="87010000" class="w-full mt-1 bg-zinc-800 border border-zinc-700 rounded-xl px-3 py-2 text-sm"></div>
-          <div><label class="text-xs text-zinc-400">Peso (kg)</label><input id="testPeso" value="5" type="number" class="w-full mt-1 bg-zinc-800 border border-zinc-700 rounded-xl px-3 py-2 text-sm"></div>
-          <div><label class="text-xs text-zinc-400">Altura (cm)</label><input id="testAlt" value="20" type="number" class="w-full mt-1 bg-zinc-800 border border-zinc-700 rounded-xl px-3 py-2 text-sm"></div>
-          <div><label class="text-xs text-zinc-400">Largura (cm)</label><input id="testLarg" value="20" type="number" class="w-full mt-1 bg-zinc-800 border border-zinc-700 rounded-xl px-3 py-2 text-sm"></div>
-          <div><label class="text-xs text-zinc-400">Comprimento (cm)</label><input id="testComp" value="30" type="number" class="w-full mt-1 bg-zinc-800 border border-zinc-700 rounded-xl px-3 py-2 text-sm"></div>
-          <div><label class="text-xs text-zinc-400">Valor NF</label><input id="testValor" value="100" type="number" class="w-full mt-1 bg-zinc-800 border border-zinc-700 rounded-xl px-3 py-2 text-sm"></div>
+      <div class="bg-zinc-900 border border-zinc-800 rounded-2xl p-5">
+        <div class="flex items-center justify-between mb-3">
+          <h3 class="font-semibold text-sm">🚚 Transportadoras</h3>
+          <button onclick="carregarTransportadoras()" class="text-[11px] bg-zinc-800 border border-zinc-700 px-2 py-1 rounded-lg">🔄</button>
         </div>
-        <button onclick="testarCotacao()" class="mt-4 w-full bg-gradient-to-r from-violet-600 to-fuchsia-600 hover:from-violet-500 hover:to-fuchsia-500 rounded-xl py-2.5 text-sm font-semibold">Calcular Frete por Transportadora</button>
-        <div id="cotacaoResult" class="hidden mt-4 p-4 bg-zinc-800 rounded-xl text-xs space-y-2"></div>
+        <div id="transpLista" class="space-y-2 max-h-[600px] overflow-auto pr-1"></div>
       </div>
     </div>
-  </div>
 
-  <p class="text-center text-xs text-zinc-600 mt-10">Ao subir nova tabela da mesma transportadora, a anterior é removida automaticamente • Dados só com UPLOAD_TOKEN</p>
+    <div class="lg:col-span-8">
+      <div class="bg-zinc-900 border border-zinc-800 rounded-2xl p-5">
+        <div id="editorHeader" class="hidden">
+          <div class="flex flex-wrap items-center justify-between gap-3 mb-4">
+            <div>
+              <h3 class="font-bold text-base">📋 Tabela: <span id="editorTranspNome" class="text-violet-400"></span></h3>
+              <p id="editorStats" class="text-xs text-zinc-400 mt-1"></p>
+            </div>
+            <div class="flex gap-2">
+              <button onclick="abrirAddLinha()" class="text-xs bg-violet-600 hover:bg-violet-500 px-3 py-2 rounded-lg">➕ Add Faixa</button>
+              <button onclick="fecharEditor()" class="text-xs bg-zinc-800 border border-zinc-700 px-3 py-2 rounded-lg">✕</button>
+            </div>
+          </div>
+
+          <div class="bg-zinc-800/50 border border-zinc-700/50 rounded-xl p-3 mb-4 grid md:grid-cols-4 gap-3 items-end">
+            <div>
+              <label class="text-[11px] text-zinc-400">Reajuste %</label>
+              <input id="reajustePerc" type="number" placeholder="5" class="w-full mt-1 bg-zinc-900 border border-zinc-700 rounded-lg px-2 py-1.5 text-xs">
+            </div>
+            <div>
+              <label class="text-[11px] text-zinc-400">Campo</label>
+              <select id="reajusteCampo" class="w-full mt-1 bg-zinc-900 border border-zinc-700 rounded-lg px-2 py-1.5 text-xs">
+                <option value="frete_valor">Frete Valor R$</option>
+                <option value="valor_por_kg">Valor Por Kg</option>
+                <option value="excedente">Excedente R$</option>
+                <option value="pedagio">Pedágio R$</option>
+                <option value="despacho">Despacho R$</option>
+              </select>
+            </div>
+            <button onclick="aplicarReajuste()" class="text-xs bg-amber-600 hover:bg-amber-500 px-3 py-2 rounded-lg h-[32px]">Aplicar</button>
+            <div class="flex gap-2">
+              <input id="buscaCep" placeholder="Buscar CEP" class="flex-1 bg-zinc-900 border border-zinc-700 rounded-lg px-2 py-1.5 text-xs">
+              <button onclick="carregarLinhas()" class="text-xs bg-zinc-700 border border-zinc-600 px-3 py-1.5 rounded-lg">🔍</button>
+            </div>
+          </div>
+
+          <div class="overflow-auto max-h-[700px] border border-zinc-800 rounded-xl">
+            <table class="w-full text-[11px] table-edit">
+              <thead class="bg-zinc-800 sticky top-0 z-10">
+                <tr class="text-zinc-400">
+                  <th class="p-2 text-left">ID</th>
+                  <th class="p-2 text-left">CEP Ini</th>
+                  <th class="p-2 text-left">CEP Fim</th>
+                  <th class="p-2 text-left">Peso Ini</th>
+                  <th class="p-2 text-left">Peso Fim</th>
+                  <th class="p-2 text-left">Frete R$</th>
+                  <th class="p-2 text-left">Exced.</th>
+                  <th class="p-2 text-left">Vlr/Kg</th>
+                  <th class="p-2 text-left">Prazo</th>
+                  <th class="p-2 text-left">Cub.</th>
+                  <th class="p-2 text-left">Ações</th>
+                </tr>
+              </thead>
+              <tbody id="linhasTabela"></tbody>
+            </table>
+          </div>
+          <div class="flex items-center justify-between mt-3 text-xs">
+            <div class="flex gap-2">
+              <button onclick="paginaAnterior()" class="bg-zinc-800 border border-zinc-700 px-3 py-1.5 rounded-lg">◀</button>
+              <span id="paginacaoInfo" class="px-2 py-1.5 text-zinc-400"></span>
+              <button onclick="proximaPagina()" class="bg-zinc-800 border border-zinc-700 px-3 py-1.5 rounded-lg">▶</button>
+            </div>
+            <span id="linhasTotal" class="text-zinc-500"></span>
+          </div>
+        </div>
+
+        <div id="editorVazio" class="text-center py-16">
+          <div class="text-4xl mb-3">📦</div>
+          <p class="text-sm font-semibold">Nenhuma transportadora selecionada</p>
+          <p class="text-xs text-zinc-500 mt-2">Clique em uma transportadora para editar faixas de CEP como na Frenet</p>
+        </div>
+      </div>
+
+      <div id="modalLinha" class="hidden fixed inset-0 bg-black/70 z-50 flex items-center justify-center p-4">
+        <div class="bg-zinc-900 border border-zinc-700 rounded-2xl p-6 w-full max-w-2xl max-h-[90vh] overflow-auto">
+          <h3 id="modalTitulo" class="font-bold mb-4">Adicionar Faixa de CEP</h3>
+          <div class="grid grid-cols-2 md:grid-cols-3 gap-3 text-xs">
+            <div><label class="text-zinc-400">CEP Inicial *</label><input id="m_cep_ini" type="number" class="w-full mt-1 bg-zinc-800 border border-zinc-700 rounded-lg px-2 py-2"></div>
+            <div><label class="text-zinc-400">CEP Final *</label><input id="m_cep_fim" type="number" class="w-full mt-1 bg-zinc-800 border border-zinc-700 rounded-lg px-2 py-2"></div>
+            <div><label class="text-zinc-400">Método</label><input id="m_metodo" value="Frete Peso" class="w-full mt-1 bg-zinc-800 border border-zinc-700 rounded-lg px-2 py-2"></div>
+            <div><label class="text-zinc-400">Peso Ini kg *</label><input id="m_peso_ini" type="number" step="0.01" value="0" class="w-full mt-1 bg-zinc-800 border border-zinc-700 rounded-lg px-2 py-2"></div>
+            <div><label class="text-zinc-400">Peso Fim kg *</label><input id="m_peso_fim" type="number" step="0.01" value="99.99" class="w-full mt-1 bg-zinc-800 border border-zinc-700 rounded-lg px-2 py-2"></div>
+            <div><label class="text-zinc-400">Frete Valor R$ *</label><input id="m_frete_valor" type="number" step="0.01" class="w-full mt-1 bg-zinc-800 border border-zinc-700 rounded-lg px-2 py-2"></div>
+            <div><label class="text-zinc-400">Prazo dias</label><input id="m_prazo" type="number" value="5" class="w-full mt-1 bg-zinc-800 border border-zinc-700 rounded-lg px-2 py-2"></div>
+            <div><label class="text-zinc-400">Cubagem</label><input id="m_cubagem" type="number" value="300" class="w-full mt-1 bg-zinc-800 border border-zinc-700 rounded-lg px-2 py-2"></div>
+            <div><label class="text-zinc-400">Limite Peso kg</label><input id="m_limite_peso" type="number" value="5000" class="w-full mt-1 bg-zinc-800 border border-zinc-700 rounded-lg px-2 py-2"></div>
+          </div>
+          <div class="flex gap-2 mt-6">
+            <button onclick="salvarLinha()" class="flex-1 bg-violet-600 hover:bg-violet-500 py-2.5 rounded-xl text-sm font-semibold">Salvar</button>
+            <button onclick="fecharModal()" class="flex-1 bg-zinc-800 border border-zinc-700 py-2.5 rounded-xl text-sm">Cancelar</button>
+          </div>
+        </div>
+      </div>
+
+    </div>
+  </div>
 </div>
 
 <script>
@@ -520,30 +735,29 @@ let token = localStorage.getItem('mf_token') || '';
 document.getElementById('tokenInput').value = token;
 const baseUrl = window.location.origin;
 function apiUrl(p){return baseUrl + p}
+let transpAtual=null;
+let paginaAtual=1;
+let totalPaginas=1;
 
 async function checkStatus(){
   try{
     const r = await fetch(apiUrl('/'));
     const j = await r.json();
     document.getElementById('dbStatus').textContent = j.db || 'online';
-    document.getElementById('totalRegras').textContent = (j.total_regras||0)+' regras • '+(j.transportadoras||0)+' transportadoras';
+    document.getElementById('totalRegras').textContent = (j.total_regras||0)+' regras • '+(j.transportadoras||0)+' transp.';
     document.getElementById('totalTransp').textContent = j.transportadoras||0;
-    document.getElementById('statusBadge').textContent = '● Online - '+(j.total_regras||0)+' regras • '+(j.transportadoras||0)+' transp.';
+    document.getElementById('statusBadge').textContent = '● Online - '+(j.total_regras||0)+' regras';
     document.getElementById('statusBadge').className='px-3 py-1 rounded-full text-xs bg-green-500/20 text-green-400 border border-green-500/30';
   }catch(e){ document.getElementById('statusBadge').textContent='● Offline'; }
 }
 checkStatus();
-
 function salvarToken(){
   token = document.getElementById('tokenInput').value.trim();
   localStorage.setItem('mf_token', token);
-  const m=document.getElementById('tokenMsg');
-  m.innerHTML='✅ Token salvo localmente.<br><span class="text-zinc-400">Protege upload, listagem e exclusão.</span>';
-  m.className='text-xs mt-2 text-green-400'; m.classList.remove('hidden');
-  carregarTabelas();
+  document.getElementById('tokenMsg').textContent='✅ Token salvo!'; document.getElementById('tokenMsg').className='text-xs mt-2 text-green-400'; document.getElementById('tokenMsg').classList.remove('hidden');
+  carregarTransportadoras();
 }
-function toggleToken(){ const i=document.getElementById('tokenInput'); i.type = i.type==='password'?'text':'password'; }
-function copyLink(){ const link = baseUrl + '/api/cotacao'; navigator.clipboard.writeText(link); const msg=document.getElementById('copyMsg'); msg.classList.remove('hidden'); setTimeout(()=>msg.classList.add('hidden'),2000); }
+function copyLink(){ navigator.clipboard.writeText(baseUrl + '/api/cotacao'); }
 
 const dropZone=document.getElementById('dropZone');
 const fileInput=document.getElementById('fileInput');
@@ -554,91 +768,205 @@ dropZone.ondrop=(e)=>{e.preventDefault(); dropZone.classList.remove('border-viol
 fileInput.onchange=(e)=>{const f=e.target.files[0]; if(f) uploadFile(f);}
 
 async function uploadFile(file){
-  if(!token){ alert('Digite e salve seu UPLOAD_TOKEN primeiro!'); return; }
+  if(!token){ alert('Salve o token primeiro!'); return; }
   const transp = document.getElementById('transpInput').value.trim().toUpperCase();
-  if(!transp){ alert('Digite o nome da transportadora primeiro! Ex: BRASPRESS'); document.getElementById('transpInput').focus(); return; }
-  if(transp.length<2){ alert('Nome da transportadora muito curto'); return; }
-
+  if(!transp){ alert('Digite o nome da transportadora!'); return; }
   const prog=document.getElementById('uploadProgress'); const bar=document.getElementById('progressBar'); const txt=document.getElementById('progressText'); const resDiv=document.getElementById('uploadResult');
   prog.classList.remove('hidden'); resDiv.classList.add('hidden'); bar.style.width='30%'; txt.textContent='Enviando '+file.name+' como '+transp+'...';
   try{
     const fd=new FormData(); fd.append('file', file); fd.append('transportadora', transp);
     bar.style.width='60%';
     const r=await fetch(apiUrl('/api/upload'),{method:'POST', headers:{'x-upload-token': token, 'x-transportadora': transp}, body: fd});
-    bar.style.width='90%';
-    const j=await r.json();
-    bar.style.width='100%';
+    bar.style.width='90%'; const j=await r.json(); bar.style.width='100%';
     if(!r.ok) throw new Error(j.erro || JSON.stringify(j));
-    resDiv.className='mt-4 p-4 rounded-xl text-sm bg-green-500/10 border border-green-500/30 text-green-300';
-    resDiv.innerHTML='<b>✅ Sucesso!</b><br>Transportadora: <b>'+esc(j.transportadora)+'</b><br>'+esc(j.total)+' regras importadas<br><span class="text-xs opacity-70">'+esc(j.mensagem||'')+'</span>';
-    resDiv.classList.remove('hidden');
-    checkStatus(); carregarTabelas();
+    resDiv.className='mt-3 p-3 rounded-xl text-xs bg-green-500/10 border border-green-500/30 text-green-300';
+    resDiv.innerHTML='<b>✅ Sucesso!</b> '+esc(j.transportadora)+' - '+esc(j.total)+' regras'; resDiv.classList.remove('hidden');
+    checkStatus(); carregarTransportadoras();
+    if(transpAtual===transp) carregarLinhas();
   }catch(e){
-    resDiv.className='mt-4 p-4 rounded-xl text-sm bg-red-500/10 border border-red-500/30 text-red-300';
-    resDiv.textContent='❌ Erro: '+e.message;
-    resDiv.classList.remove('hidden');
+    resDiv.className='mt-3 p-3 rounded-xl text-xs bg-red-500/10 border border-red-500/30 text-red-300';
+    resDiv.textContent='❌ Erro: '+e.message; resDiv.classList.remove('hidden');
   }finally{ setTimeout(()=>{prog.classList.add('hidden'); bar.style.width='0%';}, 1500); }
 }
 
-async function carregarTabelas(){
-  if(!token){ document.getElementById('transpLista').innerHTML='<p class="text-zinc-500 text-sm">Salve o token para ver as transportadoras</p>'; return; }
-  const div=document.getElementById('transpLista'); const resumoDiv=document.getElementById('tabelasResumo');
-  div.innerHTML='Carregando...';
+async function carregarTransportadoras(){
+  if(!token){ document.getElementById('transpLista').innerHTML='<p class="text-zinc-500 text-xs">Salve o token</p>'; return; }
+  const div=document.getElementById('transpLista'); div.innerHTML='Carregando...';
   try{
     const r=await fetch(apiUrl('/api/transportadoras'),{headers:{'x-upload-token': token}});
     const j=await r.json();
     if(!r.ok) throw new Error(j.erro);
-    if(j.total===0){ div.innerHTML='<p class="text-zinc-500 text-sm">Nenhuma transportadora cadastrada ainda. Faça upload informando o nome.</p>'; resumoDiv.textContent=''; return; }
+    if(j.total===0){ div.innerHTML='<p class="text-zinc-500 text-xs">Nenhuma transportadora ainda</p>'; return; }
     let html='';
     j.transportadoras.forEach(t=>{
+      const ativo = transpAtual===t.transportadora ? 'border-violet-500 bg-violet-500/10' : 'border-zinc-700 bg-zinc-800';
       html+= \`
-      <div class="bg-zinc-800 border border-zinc-700 rounded-xl p-4 flex items-center justify-between">
-        <div class="flex-1">
-          <p class="font-bold text-sm tracking-wide">\${esc(t.transportadora)}</p>
-          <p class="text-xs text-zinc-400 mt-1">\${esc(t.total)} regras • \${esc(t.metodos?.join(', ')||'')} • Prazo \${esc(t.prazoMin)}-\${esc(t.prazoMax)} dias</p>
-          <p class="text-[11px] text-zinc-500 mt-1">Atualizada: \${t.updated ? new Date(t.updated).toLocaleString('pt-BR') : '-'}</p>
-        </div>
-        <div class="flex flex-col gap-2 ml-4">
-          <button onclick="deletarTransp('\${esc(t.transportadora)}')" class="text-xs bg-red-500/20 hover:bg-red-500/30 border border-red-500/30 text-red-300 px-3 py-2 rounded-lg">🗑️ Excluir</button>
-          <button onclick="selecionarTransp('\${esc(t.transportadora)}')" class="text-xs bg-zinc-700 hover:bg-zinc-600 border border-zinc-600 px-3 py-2 rounded-lg">Usar no upload</button>
+      <div class="border rounded-xl p-3 cursor-pointer hover:border-zinc-600 \${ativo}" onclick="abrirTransportadora('\${esc(t.transportadora)}')">
+        <div class="flex justify-between items-start">
+          <div class="flex-1">
+            <p class="font-bold text-xs tracking-wide">\${esc(t.transportadora)}</p>
+            <p class="text-[11px] text-zinc-400 mt-1">\${esc(t.total)} faixas • Prazo \${esc(t.prazoMin)}-\${esc(t.prazoMax)}d</p>
+          </div>
+          <button onclick="event.stopPropagation(); deletarTransp('\${esc(t.transportadora)}')" class="text-[11px] bg-red-500/20 border border-red-500/30 text-red-300 px-2 py-1 rounded-lg ml-2">🗑️</button>
         </div>
       </div>\`;
     });
     div.innerHTML=html;
-    resumoDiv.textContent='Total: '+j.total+' transportadoras • '+j.transportadoras.reduce((s,t)=>s+t.total,0)+' regras no banco';
-  }catch(e){ div.innerHTML='<p class="text-red-400 text-sm">Erro: '+esc(e.message)+'</p>'; }
+  }catch(e){ div.innerHTML='<p class="text-red-400 text-xs">Erro: '+esc(e.message)+'</p>'; }
 }
 
-function selecionarTransp(nome){ document.getElementById('transpInput').value=nome; window.scrollTo({top:0, behavior:'smooth'}); }
+function abrirTransportadora(nome){
+  transpAtual=nome;
+  paginaAtual=1;
+  document.getElementById('editorVazio').classList.add('hidden');
+  document.getElementById('editorHeader').classList.remove('hidden');
+  document.getElementById('editorTranspNome').textContent=nome;
+  carregarTransportadoras();
+  carregarLinhas();
+}
+function fecharEditor(){
+  transpAtual=null;
+  document.getElementById('editorHeader').classList.add('hidden');
+  document.getElementById('editorVazio').classList.remove('hidden');
+  carregarTransportadoras();
+}
+
+async function carregarLinhas(){
+  if(!transpAtual) return;
+  const tbody=document.getElementById('linhasTabela');
+  const cepBusca=document.getElementById('buscaCep').value.trim();
+  tbody.innerHTML='<tr><td colspan="11" class="p-4 text-center text-zinc-500">Carregando...</td></tr>';
+  try{
+    const params=new URLSearchParams({page:paginaAtual, limit:50});
+    if(cepBusca) params.set('cep', cepBusca);
+    const r=await fetch(apiUrl('/api/tabelas/'+encodeURIComponent(transpAtual)+'/linhas?'+params.toString()),{headers:{'x-upload-token': token}});
+    const j=await r.json();
+    if(!r.ok) throw new Error(j.erro);
+    totalPaginas=j.total_pages||1;
+    document.getElementById('paginacaoInfo').textContent='Página '+j.page+' de '+j.total_pages;
+    document.getElementById('linhasTotal').textContent=j.total+' faixas';
+    document.getElementById('editorStats').textContent=j.total+' faixas de CEP • Mostrando '+j.linhas.length;
+
+    if(j.linhas.length===0){ tbody.innerHTML='<tr><td colspan="11" class="p-4 text-center text-zinc-500">Nenhuma faixa</td></tr>'; return; }
+
+    let html='';
+    j.linhas.forEach(l=>{
+      html+= \`
+      <tr id="row-\${l.id}" class="border-t border-zinc-800 hover:bg-zinc-800/50">
+        <td class="p-1">\${esc(l.id)}</td>
+        <td class="p-1"><input id="cep_ini_\${l.id}" value="\${esc(l.cep_ini)}" class="w-[90px]"></td>
+        <td class="p-1"><input id="cep_fim_\${l.id}" value="\${esc(l.cep_fim)}" class="w-[90px]"></td>
+        <td class="p-1"><input id="peso_ini_\${l.id}" value="\${esc(l.peso_ini)}" class="w-[60px]"></td>
+        <td class="p-1"><input id="peso_fim_\${l.id}" value="\${esc(l.peso_fim)}" class="w-[60px]"></td>
+        <td class="p-1"><input id="frete_valor_\${l.id}" value="\${esc(l.frete_valor)}" class="w-[70px]"></td>
+        <td class="p-1"><input id="excedente_\${l.id}" value="\${esc(l.excedente||0)}" class="w-[60px]"></td>
+        <td class="p-1"><input id="valor_por_kg_\${l.id}" value="\${esc(l.valor_por_kg||0)}" class="w-[60px]"></td>
+        <td class="p-1"><input id="prazo_\${l.id}" value="\${esc(l.prazo)}" class="w-[50px]"></td>
+        <td class="p-1"><input id="cubagem_\${l.id}" value="\${esc(l.cubagem)}" class="w-[60px]"></td>
+        <td class="p-1">
+          <div class="flex gap-1">
+            <button onclick="salvarEdicaoInline(\${l.id})" class="bg-green-600 hover:bg-green-500 text-white px-2 py-1 rounded text-[10px]">💾</button>
+            <button onclick="deletarLinha(\${l.id})" class="bg-red-600 hover:bg-red-500 text-white px-2 py-1 rounded text-[10px]">🗑️</button>
+          </div>
+        </td>
+      </tr>\`;
+    });
+    tbody.innerHTML=html;
+  }catch(e){ tbody.innerHTML='<tr><td colspan="11" class="p-4 text-center text-red-400">Erro: '+esc(e.message)+'</td></tr>'; }
+}
+
+async function salvarEdicaoInline(id){
+  const payload={
+    cep_ini: parseInt(document.getElementById('cep_ini_'+id).value)||0,
+    cep_fim: parseInt(document.getElementById('cep_fim_'+id).value)||99999999,
+    peso_ini: parseFloat(document.getElementById('peso_ini_'+id).value)||0,
+    peso_fim: parseFloat(document.getElementById('peso_fim_'+id).value)||999,
+    frete_valor: parseFloat(document.getElementById('frete_valor_'+id).value)||0,
+    excedente: parseFloat(document.getElementById('excedente_'+id).value)||0,
+    valor_por_kg: parseFloat(document.getElementById('valor_por_kg_'+id).value)||0,
+    prazo: parseInt(document.getElementById('prazo_'+id).value)||5,
+    cubagem: parseFloat(document.getElementById('cubagem_'+id).value)||300,
+  };
+  try{
+    const r=await fetch(apiUrl('/api/tabelas/linha/'+id),{method:'PUT', headers:{'Content-Type':'application/json','x-upload-token': token}, body: JSON.stringify(payload)});
+    const j=await r.json();
+    if(!r.ok) throw new Error(j.erro);
+    const row=document.getElementById('row-'+id);
+    row.classList.add('bg-green-500/20'); setTimeout(()=>row.classList.remove('bg-green-500/20'), 1000);
+  }catch(e){ alert('Erro ao salvar: '+e.message); }
+}
+
+async function deletarLinha(id){
+  if(!confirm('Excluir essa faixa de CEP? ID '+id)) return;
+  try{
+    const r=await fetch(apiUrl('/api/tabelas/linha/'+id),{method:'DELETE', headers:{'x-upload-token': token}});
+    const j=await r.json();
+    if(!r.ok) throw new Error(j.erro);
+    document.getElementById('row-'+id).remove();
+  }catch(e){ alert('Erro: '+e.message); }
+}
+
+function abrirAddLinha(){
+  document.getElementById('modalTitulo').textContent='Adicionar Faixa em '+transpAtual;
+  document.getElementById('m_cep_ini').value='';
+  document.getElementById('m_cep_fim').value='';
+  document.getElementById('m_peso_ini').value='0';
+  document.getElementById('m_peso_fim').value='99.99';
+  document.getElementById('m_frete_valor').value='';
+  document.getElementById('modalLinha').classList.remove('hidden');
+}
+function fecharModal(){ document.getElementById('modalLinha').classList.add('hidden'); }
+
+async function salvarLinha(){
+  const payload={
+    cep_ini: parseInt(document.getElementById('m_cep_ini').value)||0,
+    cep_fim: parseInt(document.getElementById('m_cep_fim').value)||99999999,
+    metodo: document.getElementById('m_metodo').value||'Frete Peso',
+    peso_ini: parseFloat(document.getElementById('m_peso_ini').value)||0,
+    peso_fim: parseFloat(document.getElementById('m_peso_fim').value)||999,
+    frete_valor: parseFloat(document.getElementById('m_frete_valor').value)||0,
+    prazo: parseInt(document.getElementById('m_prazo').value)||5,
+    cubagem: parseFloat(document.getElementById('m_cubagem').value)||300,
+    limite_peso: parseFloat(document.getElementById('m_limite_peso').value)||5000,
+  };
+  if(!payload.cep_ini || !payload.cep_fim){ alert('CEP Inicial e Final obrigatórios'); return; }
+  try{
+    const r=await fetch(apiUrl('/api/tabelas/'+encodeURIComponent(transpAtual)+'/linha'),{method:'POST', headers:{'Content-Type':'application/json','x-upload-token': token}, body: JSON.stringify(payload)});
+    const j=await r.json();
+    if(!r.ok) throw new Error(j.erro);
+    fecharModal(); carregarLinhas(); checkStatus();
+  }catch(e){ alert('Erro: '+e.message); }
+}
+
+async function aplicarReajuste(){
+  const perc=parseFloat(document.getElementById('reajustePerc').value);
+  const campo=document.getElementById('reajusteCampo').value;
+  if(isNaN(perc)){ alert('Digite o percentual'); return; }
+  if(!confirm('Aplicar reajuste de '+perc+'% em '+campo+' para TODAS as faixas de '+transpAtual+'?')) return;
+  try{
+    const r=await fetch(apiUrl('/api/tabelas/'+encodeURIComponent(transpAtual)+'/reajuste'),{method:'POST', headers:{'Content-Type':'application/json','x-upload-token': token}, body: JSON.stringify({percentual:perc, campo})});
+    const j=await r.json();
+    if(!r.ok) throw new Error(j.erro);
+    alert('Reajuste aplicado em '+j.afetadas+' faixas!');
+    carregarLinhas();
+  }catch(e){ alert('Erro: '+e.message); }
+}
+
+function paginaAnterior(){ if(paginaAtual>1){ paginaAtual--; carregarLinhas(); } }
+function proximaPagina(){ if(paginaAtual<totalPaginas){ paginaAtual++; carregarLinhas(); } }
+
 async function deletarTransp(nome){
-  if(!confirm('Excluir TODAS as regras da transportadora '+nome+'? Isso não pode ser desfeito.')) return;
+  if(!confirm('Excluir TODA a tabela da transportadora '+nome+'?')) return;
   try{
     const r=await fetch(apiUrl('/api/tabelas/'+encodeURIComponent(nome)),{method:'DELETE', headers:{'x-upload-token': token}});
     const j=await r.json();
     if(!r.ok) throw new Error(j.erro);
-    alert('Removidas '+j.removidas+' regras de '+nome);
-    checkStatus(); carregarTabelas();
+    if(transpAtual===nome) fecharEditor();
+    carregarTransportadoras(); checkStatus();
   }catch(e){ alert('Erro: '+e.message); }
 }
 
-async function testarCotacao(){
-  const cep=document.getElementById('testCep').value;
-  const peso=parseFloat(document.getElementById('testPeso').value);
-  const alt=parseFloat(document.getElementById('testAlt').value);
-  const larg=parseFloat(document.getElementById('testLarg').value);
-  const comp=parseFloat(document.getElementById('testComp').value);
-  const valor=parseFloat(document.getElementById('testValor').value);
-  const div=document.getElementById('cotacaoResult'); div.classList.remove('hidden'); div.innerHTML='Calculando...';
-  try{
-    const r=await fetch(apiUrl('/api/cotacao'),{method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({cep_destino:cep,peso_real:peso,altura:alt,largura:larg,comprimento:comp,valor_nf:valor})});
-    const j=await r.json();
-    if(!r.ok) throw new Error(j.erro);
-    if(j.cotacoes.length===0){ div.innerHTML='<p class="text-yellow-400">⚠️ Nenhuma regra encontrada para CEP '+esc(j.cep_consultado)+' e peso '+esc(j.peso_taxado)+'kg.</p>'; return; }
-    let html='<p class="font-semibold text-green-400">'+esc(j.total_encontrado)+' transportadoras encontradas (peso taxado: '+esc(j.peso_taxado)+'kg)</p>';
-    j.cotacoes.forEach(c=>{ html+='<div class="flex justify-between bg-zinc-900 border border-zinc-800 p-3 rounded-xl mt-2"><div><p class="font-bold text-sm tracking-wide">'+esc(c.transportadora)+'</p><p class="text-zinc-500 text-xs">Método: '+esc(c.metodo)+' • Prazo: '+esc(c.prazo)+' dias • Cubado: '+esc(c.peso_cubado)+'kg</p></div><div class="text-right"><p class="font-bold text-lg">R$ '+esc(c.valor_frete.toFixed(2))+'</p><p class="text-zinc-500 text-xs">'+esc(c.peso_taxado)+'kg taxado</p></div></div>'; });
-    div.innerHTML=html;
-  }catch(e){ div.innerHTML='<p class="text-red-400">Erro: '+e.message+'</p>'; }
-}
+carregarTransportadoras();
 </script>
 </body>
 </html>
