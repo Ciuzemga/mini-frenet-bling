@@ -708,8 +708,8 @@ body{font-family:Inter,sans-serif}
         <div class="bg-zinc-900 border border-zinc-700 rounded-2xl p-6 w-full max-w-2xl max-h-[90vh] overflow-auto">
           <h3 id="modalTitulo" class="font-bold mb-4">Adicionar Faixa de CEP</h3>
           <div class="grid grid-cols-2 md:grid-cols-3 gap-3 text-xs">
-            <div><label class="text-zinc-400">CEP Inicial *</label><input id="m_cep_ini" type="number" class="w-full mt-1 bg-zinc-800 border border-zinc-700 rounded-lg px-2 py-2"></div>
-            <div><label class="text-zinc-400">CEP Final *</label><input id="m_cep_fim" type="number" class="w-full mt-1 bg-zinc-800 border border-zinc-700 rounded-lg px-2 py-2"></div>
+            <div><label class="text-zinc-400">CEP Inicial *</label><input id="m_cep_ini" type="text" placeholder="01000-000" inputmode="numeric" class="w-full mt-1 bg-zinc-800 border border-zinc-700 rounded-lg px-2 py-2"></div>
+            <div><label class="text-zinc-400">CEP Final *</label><input id="m_cep_fim" type="text" placeholder="08499-999" inputmode="numeric" class="w-full mt-1 bg-zinc-800 border border-zinc-700 rounded-lg px-2 py-2"></div>
             <div><label class="text-zinc-400">Método</label><input id="m_metodo" value="Frete Peso" class="w-full mt-1 bg-zinc-800 border border-zinc-700 rounded-lg px-2 py-2"></div>
             <div><label class="text-zinc-400">Peso Ini kg *</label><input id="m_peso_ini" type="number" step="0.01" value="0" class="w-full mt-1 bg-zinc-800 border border-zinc-700 rounded-lg px-2 py-2"></div>
             <div><label class="text-zinc-400">Peso Fim kg *</label><input id="m_peso_fim" type="number" step="0.01" value="99.99" class="w-full mt-1 bg-zinc-800 border border-zinc-700 rounded-lg px-2 py-2"></div>
@@ -877,8 +877,8 @@ async function carregarLinhas(){
 
 async function salvarEdicaoInline(id){
   const payload={
-    cep_ini: parseInt(document.getElementById('cep_ini_'+id).value)||0,
-    cep_fim: parseInt(document.getElementById('cep_fim_'+id).value)||99999999,
+    cep_ini: limparCep(document.getElementById('cep_ini_'+id).value),
+    cep_fim: limparCep(document.getElementById('cep_fim_'+id).value),
     peso_ini: parseFloat(document.getElementById('peso_ini_'+id).value)||0,
     peso_fim: parseFloat(document.getElementById('peso_fim_'+id).value)||999,
     frete_valor: parseFloat(document.getElementById('frete_valor_'+id).value)||0,
@@ -906,6 +906,7 @@ async function deletarLinha(id){
   }catch(e){ alert('Erro: '+e.message); }
 }
 
+function limparCep(v){ return parseInt(String(v).replace(/\D/g,''))||0; }
 function abrirAddLinha(){
   document.getElementById('modalTitulo').textContent='Adicionar Faixa em '+transpAtual;
   document.getElementById('m_cep_ini').value='';
@@ -917,19 +918,20 @@ function abrirAddLinha(){
 }
 function fecharModal(){ document.getElementById('modalLinha').classList.add('hidden'); }
 
+function limparCep(v){ return parseInt(String(v).replace(/\D/g,''))||0; }
 async function salvarLinha(){
   const payload={
-    cep_ini: parseInt(document.getElementById('m_cep_ini').value)||0,
-    cep_fim: parseInt(document.getElementById('m_cep_fim').value)||99999999,
+    cep_ini: limparCep(document.getElementById('m_cep_ini').value),
+    cep_fim: limparCep(document.getElementById('m_cep_fim').value),
     metodo: document.getElementById('m_metodo').value||'Frete Peso',
     peso_ini: parseFloat(document.getElementById('m_peso_ini').value)||0,
     peso_fim: parseFloat(document.getElementById('m_peso_fim').value)||999,
-    frete_valor: parseFloat(document.getElementById('m_frete_valor').value)||0,
+    frete_valor: parseFloat(String(document.getElementById('m_frete_valor').value).replace(',','.'))||0,
     prazo: parseInt(document.getElementById('m_prazo').value)||5,
     cubagem: parseFloat(document.getElementById('m_cubagem').value)||300,
     limite_peso: parseFloat(document.getElementById('m_limite_peso').value)||5000,
   };
-  if(!payload.cep_ini || !payload.cep_fim){ alert('CEP Inicial e Final obrigatórios'); return; }
+  if(!payload.cep_ini || !payload.cep_fim){ alert('CEP Inicial e Final obrigatórios. Digite apenas números, ex: 01000000 ou 01000-000'); return; }
   try{
     const r=await fetch(apiUrl('/api/tabelas/'+encodeURIComponent(transpAtual)+'/linha'),{method:'POST', headers:{'Content-Type':'application/json','x-upload-token': token}, body: JSON.stringify(payload)});
     const j=await r.json();
