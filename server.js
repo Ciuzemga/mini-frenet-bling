@@ -37,13 +37,21 @@ async function initDB(){
     CREATE TABLE IF NOT EXISTS integracoes (id SERIAL PRIMARY KEY, plataforma TEXT NOT NULL, nome TEXT, api_key TEXT, token TEXT, url_loja TEXT, status TEXT DEFAULT 'configurado', created_at TIMESTAMP DEFAULT NOW());
     CREATE TABLE IF NOT EXISTS audit_log (id SERIAL PRIMARY KEY, user_id INT, user_email TEXT, acao TEXT NOT NULL, recurso TEXT, detalhes JSONB, ip TEXT, created_at TIMESTAMP DEFAULT NOW());
     CREATE TABLE IF NOT EXISTS sessoes (id SERIAL PRIMARY KEY, user_id INT NOT NULL, token_hash TEXT NOT NULL, ip TEXT, expira_em TIMESTAMP NOT NULL, revogado BOOLEAN DEFAULT false, created_at TIMESTAMP DEFAULT NOW());`);
-    const cnt=await pool.query('SELECT COUNT(*) FROM colaboradores');
+    const adminEmail = (process.env.ADMIN_EMAIL||'admin@ciuzelog.com').toLowerCase();
+    const adminPass = process.env.ADMIN_PASSWORD||process.env.UPLOAD_TOKEN||'Admin@123Seguro!';
+    const hash=await bcrypt.hash(adminPass,10);
+    const cnt=await pool.query('SELECT COUNT(*) FROM colaboradores WHERE email=$1',[adminEmail]);
     if(parseInt(cnt.rows[0].count)===0){
-      const hash=await bcrypt.hash(process.env.ADMIN_PASSWORD||process.env.UPLOAD_TOKEN||'Admin@123Seguro!',10);
-      await pool.query(`INSERT INTO colaboradores (nome,email,senha_hash,role) VALUES ($1,$2,$3,'admin') ON CONFLICT DO NOTHING`,['Admin CIUZE',(process.env.ADMIN_EMAIL||'admin@ciuzelog.com').toLowerCase(),hash]);
-      console.log('🔐 Admin criado:', process.env.ADMIN_EMAIL||'admin@ciuzelog.com');
+      await pool.query(`INSERT INTO colaboradores (nome,email,senha_hash,role) VALUES ($1,$2,$3,'admin') ON CONFLICT (email) DO NOTHING`,['Admin CIUZE',adminEmail,hash]);
+      console.log('🔐 Admin CRIADO:', adminEmail);
+    } else {
+      // FORÇA atualização da senha sempre que mudar a variável na Railway
+      await pool.query(`UPDATE colaboradores SET senha_hash=$1, ativo=true, tentativas_login=0, bloqueado_ate=NULL WHERE email=$2`,[hash, adminEmail]);
+      console.log('🔐 Admin ATUALIZADO com nova senha:', adminEmail);
     }
-    DB_READY=true; console.log('✅ DB pronto');
+    // Limpa qualquer bloqueio de tentativas
+    await pool.query(`UPDATE colaboradores SET tentativas_login=0, bloqueado_ate=NULL WHERE email=$1`,[adminEmail]);
+    DB_READY=true; console.log('✅ DB pronto - login liberado');
   }catch(e){ console.error('⚠️ initDB falhou:', e.message); setTimeout(initDB, 5000); }
 }
 initDB();
