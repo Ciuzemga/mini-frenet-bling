@@ -1,8 +1,12 @@
 {
   "name": "mini-frenet-bling",
+  "version": "1.0.0",
   "type": "module",
   "main": "server.js",
-  "scripts": { "start": "node server.js" },
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
   "dependencies": {
     "fastify": "^4.28.0",
     "@fastify/cors": "^9.0.1",
@@ -11,5 +15,8 @@
     "dotenv": "^16.4.5",
     "bcryptjs": "^2.4.3",
     "xlsx": "^0.18.5"
+  },
+  "engines": {
+    "node": ">=18.0.0"
   }
 }
