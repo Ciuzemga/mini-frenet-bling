@@ -10,8 +10,8 @@ const app = Fastify({ logger: false });
 await app.register(cors, { origin: '*', credentials: true });
 await app.register(multipart, { limits: { fileSize: 30*1024*1024 } });
 
-app.get('/health', async ()=> ({ ok:true, version:'v6-allpost-frenet-profissional', ts:Date.now(), uptime:process.uptime(), status:'online', professional:true }));
-app.get('/api/status', async ()=> ({ ok:true, professional:true, uptime:process.uptime() }));
+app.get('/health', async ()=> ({ ok:true, version:'v6.1-fix-ultimo_login', ts:Date.now(), uptime:process.uptime(), status:'online' }));
+app.get('/api/status', async ()=> ({ ok:true, uptime:process.uptime() }));
 app.get('/', async (req,reply)=> reply.redirect('/painel'));
 
 // BANCO
@@ -71,6 +71,7 @@ async function auth(req,reply){
   return p;
 }
 
+// FIX DEFINITIVO - AGORA COM ultimo_login
 app.get('/reset-admin-agora', async (req,reply)=>{
   if((req.query.key||'')!== (process.env.RESET_KEY||'ciuzelog-reset-2026')) return reply.code(403).send({erro:'Use?key=RESET_KEY'});
   try{
@@ -79,16 +80,30 @@ app.get('/reset-admin-agora', async (req,reply)=>{
     const pass=String(process.env.ADMIN_PASSWORD||'Ciuze@2026!Segura').trim();
     const hash=await bcrypt.hash(pass,8);
     await pool.query(`DROP TABLE IF EXISTS sessoes, colaboradores CASCADE`);
-    await pool.query(`CREATE TABLE colaboradores (id SERIAL PRIMARY KEY, nome TEXT, email TEXT UNIQUE, senha_hash TEXT, role TEXT DEFAULT 'admin', ativo BOOLEAN DEFAULT true, tentativas_login INT DEFAULT 0, bloqueado_ate TIMESTAMP, created_at TIMESTAMP DEFAULT NOW()); CREATE TABLE sessoes (id SERIAL PRIMARY KEY, user_id INT, token_hash TEXT, ip TEXT, expira_em TIMESTAMP, revogado BOOLEAN DEFAULT false, created_at TIMESTAMP DEFAULT NOW());`);
+    await pool.query(`
+      CREATE TABLE colaboradores (
+        id SERIAL PRIMARY KEY,
+        nome TEXT NOT NULL,
+        email TEXT UNIQUE NOT NULL,
+        senha_hash TEXT NOT NULL,
+        role TEXT DEFAULT 'colaborador',
+        ativo BOOLEAN DEFAULT true,
+        tentativas_login INT DEFAULT 0,
+        bloqueado_ate TIMESTAMP,
+        ultimo_login TIMESTAMP,
+        created_at TIMESTAMP DEFAULT NOW()
+      );
+      CREATE TABLE sessoes (id SERIAL PRIMARY KEY, user_id INT NOT NULL, token_hash TEXT NOT NULL, ip TEXT, expira_em TIMESTAMP NOT NULL, revogado BOOLEAN DEFAULT false, created_at TIMESTAMP DEFAULT NOW());
+    `);
     await pool.query(`INSERT INTO colaboradores (nome,email,senha_hash,role) VALUES ($1,$2,$3,'admin')`,['Admin CIUZE',email,hash]);
-    return {ok:true, email, senha:pass, msg:'Admin resetado'};
+    return {ok:true, email, senha:pass, msg:'Admin resetado COM ultimo_login - pode logar agora'};
   }catch(e){ return {erro:e.message}; }
 });
 
 app.post('/api/auth/login', async (req,reply)=>{
   const {email,senha}=req.body||{}; if(!email||!senha) return reply.code(400).send({erro:'Informe email e senha'});
   const emailClean=String(email).toLowerCase().trim(), senhaClean=String(senha).trim();
-  if(!pool) return reply.code(503).send({erro:'Banco iniciando'});
+  if(!pool) return reply.code(503).send({erro:'Banco iniciando, aguarde 5s'});
   try{
     const res=await pool.query('SELECT * FROM colaboradores WHERE email=$1',[emailClean]);
     if(!res.rows.length) return reply.code(401).send({erro:'Email não cadastrado'});
@@ -101,7 +116,7 @@ app.post('/api/auth/login', async (req,reply)=>{
     const th=crypto.createHash('sha256').update(token).digest('hex');
     await pool.query(`INSERT INTO sessoes (user_id,token_hash,ip,expira_em) VALUES ($1,$2,$3,$4)`,[user.id,th,req.ip,new Date(Date.now()+43200000)]);
     return {ok:true,token,user:payload};
-  }catch(e){ return reply.code(500).send({erro:e.message}); }
+  }catch(e){ console.error(e); return reply.code(500).send({erro:e.message}); }
 });
 
 app.post('/api/auth/forgot-password', async (req,reply)=>{
@@ -151,8 +166,8 @@ app.post('/api/cotacao', async (req,reply)=>{
   const p=await auth(req,reply); if(!p) return; const {cep_destino,peso_real,altura,largura,comprimento}=req.body||{}; const cep=limparCep(cep_destino); const peso=parseFloat(peso_real||1); const cub=calcCub(altura,largura,comprimento); const pesoTaxado=Math.max(peso,cub); if(!cep) return reply.code(400).send({erro:'CEP destino'}); if(!pool) return reply.code(503).send({erro:'Sem banco'}); try{ const r=await pool.query('SELECT * FROM frete_tabelas WHERE $1 BETWEEN cep_ini AND cep_fim AND $2 BETWEEN peso_ini AND peso_fim ORDER BY frete_valor ASC LIMIT 20',[cep,pesoTaxado]); const cot=r.rows.map(x=>({transportadora:x.transportadora, valor_frete:parseFloat(x.frete_valor), prazo:x.prazo, prazo_texto:`${x.prazo} dias`, peso_taxado:pesoTaxado, peso_cubado:cub})); return {cotacoes:cot, peso_taxado:pesoTaxado, total_encontrado:cot.length}; }catch(e){ return reply.code(500).send({erro:e.message}); }
 });
 app.get('/api/dashboard', async (req,reply)=>{ const p=await auth(req,reply); if(!p) return; let total_regras=0, transportadoras=0; if(pool){ try{ const r1=await pool.query('SELECT COUNT(*) FROM frete_tabelas'); total_regras=parseInt(r1.rows[0].count); }catch{} try{ const r2=await pool.query('SELECT COUNT(DISTINCT transportadora) FROM frete_tabelas'); transportadoras=parseInt(r2.rows[0].count); }catch{} } return {total_regras, transportadoras, cotacoes_hoje:0, cotacoes_total:0, por_transportadora:[], ultimas_cotacoes:[]}; });
-app.get('/api/colaboradores', async (req,reply)=>{ const p=await auth(req,reply); if(!p) return; const r=await pool.query('SELECT id,nome,email,role FROM colaboradores ORDER BY id'); return {total:r.rows.length, colaboradores:r.rows}; });
-app.post('/api/colaboradores', async (req,reply)=>{ const p=await auth(req,reply); if(!p) return; const {nome,email,senha,role}=req.body||{}; if(!nome||!email||!senha) return reply.code(400).send({erro:'Nome, email e senha obrigatórios'}); if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(email))) return reply.code(400).send({erro:'Email inválido'}); const hash=await bcrypt.hash(String(senha).trim(),8); try{ const r=await pool.query('INSERT INTO colaboradores (nome,email,senha_hash,role) VALUES ($1,$2,$3,$4) ON CONFLICT (email) DO UPDATE SET nome=$1, senha_hash=$3, role=$4, ativo=true RETURNING id,nome,email,role',[nome,String(email).toLowerCase().trim(),hash,role||'colaborador']); return {ok:true, colaborador:r.rows[0]}; }catch{ return reply.code(400).send({erro:'Email já cadastrado'}); }});
+app.get('/api/colaboradores', async (req,reply)=>{ const p=await auth(req,reply); if(!p) return; const r=await pool.query('SELECT id,nome,email,role,ultimo_login FROM colaboradores ORDER BY id'); return {total:r.rows.length, colaboradores:r.rows}; });
+app.post('/api/colaboradores', async (req,reply)=>{ const p=await auth(req,reply); if(!p) return; const {nome,email,senha,role}=req.body||{}; if(!nome||!email||!senha) return reply.code(400).send({erro:'Nome, email e senha obrigatórios'}); const hash=await bcrypt.hash(String(senha).trim(),8); try{ const r=await pool.query('INSERT INTO colaboradores (nome,email,senha_hash,role) VALUES ($1,$2,$3,$4) ON CONFLICT (email) DO UPDATE SET nome=$1, senha_hash=$3, role=$4, ativo=true RETURNING id,nome,email,role',[nome,String(email).toLowerCase().trim(),hash,role||'colaborador']); return {ok:true, colaborador:r.rows[0]}; }catch{ return reply.code(400).send({erro:'Email já cadastrado'}); }});
 app.delete('/api/colaboradores/:id', async (req,reply)=>{ const p=await auth(req,reply); if(!p) return; if(parseInt(req.params.id)===1) return reply.code(400).send({erro:'Não pode deletar admin'}); await pool.query('DELETE FROM colaboradores WHERE id=$1',[parseInt(req.params.id)]); return {ok:true}; });
 app.get('/api/api-keys', async (req,reply)=>{ const p=await auth(req,reply); if(!p) return; try{ const r=await pool.query('SELECT id,nome,plataforma,chave FROM api_keys ORDER BY id DESC'); return {total:r.rows.length, keys:r.rows}; }catch{ return {total:0, keys:[]}; }});
 app.post('/api/api-keys', async (req,reply)=>{ const p=await auth(req,reply); if(!p) return; const {nome,plataforma}=req.body||{}; const chave='sk_live_'+crypto.randomBytes(16).toString('hex'); const r=await pool.query('INSERT INTO api_keys (nome,chave,plataforma) VALUES ($1,$2,$3) RETURNING id',[nome,chave,plataforma||'geral']); return {ok:true, chave}; });
@@ -162,17 +177,58 @@ app.post('/api/integracoes', async (req,reply)=>{ const p=await auth(req,reply);
 app.delete('/api/integracoes/:id', async (req,reply)=>{ const p=await auth(req,reply); if(!p) return; await pool.query('DELETE FROM integracoes WHERE id=$1',[parseInt(req.params.id)]); return {ok:true}; });
 app.get('/api/historico', async (req,reply)=>{ const p=await auth(req,reply); if(!p) return; const r=await pool.query('SELECT * FROM cotacoes_log ORDER BY id DESC LIMIT 100'); return {total:r.rows.length, historico:r.rows}; });
 
-// ========== PAINEL - ROTAS QUE FALTARAM ==========
+// PAINEL
 app.get('/esqueci-senha', async (req,reply)=>{
-  reply.type('text/html').send(`<!DOCTYPE html><html lang="pt-BR"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Recuperar • CIUZE LOG</title><script src="https://cdn.tailwindcss.com"></script></head><body class="bg-[#050507] min-h-screen flex items-center justify-center p-6"><div class="w-full max-w-[400px]"><div class="bg-[#0f0f10] border border-zinc-800 rounded-[24px] p-7"><input id="email" placeholder="Email" value="admin@ciuzelog.com" class="w-full bg-black border border-zinc-800 rounded-xl px-4 py-3 text-white"><button onclick="fetch('/api/auth/forgot-password',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email:document.getElementById('email').value})}).then(r=>r.json()).then(j=>alert(JSON.stringify(j)))" class="w-full mt-4 bg-amber-400 text-black rounded-xl py-3 font-bold">Enviar link</button><a href="/painel" class="block text-center mt-3 text-zinc-400 text-sm">Voltar</a></div></div></body></html>`);
+  reply.type('text/html').send(`<!DOCTYPE html><html lang="pt-BR"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Recuperar • CIUZE LOG</title><script src="https://cdn.tailwindcss.com"></script></head><body class="bg-[#050507] min-h-screen flex items-center justify-center p-6"><div class="w-full max-w-"><div class="bg-[#0f0f10] border border-zinc-800 rounded- p-7"><h1 class="font-bold">Recuperar senha</h1><input id="email" placeholder="Email" value="admin@ciuzelog.com" class="w-full mt-4 bg-black border border-zinc-800 rounded-xl px-4 py-3 text-white"><div id="res" class="mt-3 text-sm text-zinc-400"></div><button onclick="go()" class="w-full mt-4 bg-amber-400 text-black rounded-xl py-3 font-bold">Enviar link</button><a href="/painel" class="block text-center mt-3 text-zinc-400 text-sm">Voltar</a></div></div><script>async function go(){ const email=document.getElementById('email').value; const r=await fetch('/api/auth/forgot-password',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email})}); const j=await r.json(); document.getElementById('res').innerHTML = j.link? '<a class=\\'text-amber-400 underline\\' href=\\''+j.link+'\\'>'+j.link+'</a>' : JSON.stringify(j); }</script></body></html>`);
 });
 app.get('/redefinir-senha', async (req,reply)=>{
   const token=req.query.token||'';
-  reply.type('text/html').send(`<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Nova Senha</title><script src="https://cdn.tailwindcss.com"></script></head><body class="bg-black min-h-screen flex items-center justify-center p-6"><div class="bg-zinc-900 border border-zinc-800 rounded-xl p-6 w-full max-w-sm"><input id="token" value="${token}" class="w-full bg-black border rounded-xl px-3 py-2 text-xs text-white mb-3"><input id="nova" type="password" placeholder="Nova senha" class="w-full bg-black border rounded-xl px-3 py-3 text-white mb-3"><button onclick="fetch('/api/auth/reset-password',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token:document.getElementById('token').value,nova_senha:document.getElementById('nova').value})}).then(r=>r.json()).then(j=>{alert(j.msg||j.erro); if(j.ok) location='/painel'})" class="w-full bg-amber-400 text-black rounded-xl py-3 font-bold">Redefinir</button></div></body></html>`);
+  reply.type('text/html').send(`<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Nova Senha</title><script src="https://cdn.tailwindcss.com"></script></head><body class="bg-black min-h-screen flex items-center justify-center p-6"><div class="bg-zinc-900 border border-zinc-800 rounded-xl p-6 w-full max-w-sm"><h1 class="font-bold mb-3">Nova senha</h1><input id="token" value="${token}" class="w-full bg-black border border-zinc-700 rounded-xl px-3 py-2 text-xs text-white mb-3"><input id="nova" type="password" placeholder="Nova senha" class="w-full bg-black border border-zinc-700 rounded-xl px-3 py-3 text-white mb-3"><button onclick="go()" class="w-full bg-amber-400 text-black rounded-xl py-3 font-bold">Redefinir</button></div><script>async function go(){ const r=await fetch('/api/auth/reset-password',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token:document.getElementById('token').value,nova_senha:document.getElementById('nova').value})}); const j=await r.json(); alert(j.msg||j.erro); if(j.ok) location='/painel'; }</script></body></html>`);
 });
 
 app.get('/painel', async (req,reply)=>{
-  reply.type('text/html').send(`<!DOCTYPE html><html lang="pt-BR"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>CIUZE LOG</title><script src="https://cdn.tailwindcss.com"></script></head><body class="bg-[#09090b] text-white min-h-screen flex items-center justify-center p-6"><div class="w-full max-w-[400px]"><div class="bg-[#0f0f10] border border-zinc-800 rounded-[24px] p-7"><h1 class="font-bold text-xl">CIUZE LOG - Login</h1><input id="email" value="admin@ciuzelog.com" class="w-full mt-4 bg-black border border-zinc-800 rounded-xl px-4 py-3 text-white"><input id="senha" type="password" placeholder="Senha" class="w-full mt-3 bg-black border border-zinc-800 rounded-xl px-4 py-3 text-white"><div id="erro" class="hidden mt-3 p-3 bg-red-500/10 text-red-300 text-sm rounded-xl"></div><button onclick="login()" id="btn" class="w-full mt-4 bg-amber-400 text-black rounded-xl py-3 font-bold">ENTRAR</button><div class="mt-4 text-center"><a href="/esqueci-senha" class="text-xs text-amber-400">Esqueci a senha</a> | <a href="/health" class="text-xs text-zinc-500">/health</a></div></div></div><script>async function login(){ const email=document.getElementById('email').value, senha=document.getElementById('senha').value; const btn=document.getElementById('btn'), erro=document.getElementById('erro'); btn.textContent='Entrando...'; try{ const r=await fetch('/api/auth/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email,senha})}); const j=await r.json(); if(!r.ok) throw new Error(j.erro); localStorage.setItem('cz_token',j.token); document.body.innerHTML='<div class=\\'p-10 text-center\\'><h1 class=\\'text-2xl font-bold\\'>Login OK!</h1><p>Token salvo. Sistema corrigido.</p><p class=\\'mt-4\\'><a href=/api/dashboard class=\\'text-amber-400 underline\\' >Testar API Dashboard</a></p><p class=\\'mt-2 text-sm text-zinc-400\\'>Agora recole o HTML completo do painel antigo por cima deste arquivo se quiser o layout completo.</p></div>'; }catch(e){ erro.textContent=e.message; erro.classList.remove('hidden'); btn.textContent='ENTRAR'; } }</script></body></html>`);
+  reply.type('text/html').send(`<!DOCTYPE html><html lang="pt-BR"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>CIUZE LOG • Painel</title><script src="https://cdn.tailwindcss.com"></script><style>@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap');*{font-family:Inter}</style></head><body class="bg-[#09090b] text-white min-h-screen flex items-center justify-center p-6" id="body">
+<div id="loginBox" class="w-full max-w-"><div class="bg-[#0f0f10] border border-zinc-800 rounded- p-7 shadow-2xl"><h1 class="font-bold text-xl">CIUZE LOG - Login</h1><p class="text-xs text-zinc-500 mt-1">v6.1 FIX ultimo_login</p><input id="email" value="admin@ciuzelog.com" class="w-full mt-5 bg-black border border-zinc-800 rounded-xl px-4 py-3 text-white text-sm outline-none focus:border-amber-400"><input id="senha" type="password" placeholder="Senha" class="w-full mt-3 bg-black border border-zinc-800 rounded-xl px-4 py-3 text-white text-sm outline-none focus:border-amber-400"><div id="erro" class="hidden mt-3 p-3 bg-red-500/10 border border-red-500/20 text-red-300 text-xs rounded-xl"></div><button onclick="login()" id="btn" class="w-full mt-4 bg-amber-400 hover:bg-amber-300 text-black rounded-xl py-3 font-bold text-sm transition">ENTRAR</button><div class="mt-4 text-center flex justify-center gap-2 text-xs"><a href="/esqueci-senha" class="text-amber-400 hover:underline">Esqueci a senha</a><span class="text-zinc-600">|</span><a href="/health" class="text-zinc-500">/health</a></div></div></div>
+<script>
+async function login(){
+  const email=document.getElementById('email').value.trim(), senha=document.getElementById('senha').value.trim();
+  const btn=document.getElementById('btn'), erro=document.getElementById('erro');
+  if(!email||!senha){ erro.textContent='Preencha email e senha'; erro.classList.remove('hidden'); return; }
+  btn.textContent='Entrando...'; btn.disabled=true; erro.classList.add('hidden');
+  try{
+    const r=await fetch('/api/auth/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email,senha})});
+    const j=await r.json();
+    if(!r.ok) throw new Error(j.erro||'Erro login');
+    localStorage.setItem('cz_token',j.token);
+    localStorage.setItem('cz_user',JSON.stringify(j.user));
+    location.reload();
+  }catch(e){ erro.textContent=e.message; erro.classList.remove('hidden'); btn.textContent='ENTRAR'; btn.disabled=false; }
+}
+(async function check(){
+  const token=localStorage.getItem('cz_token');
+  if(!token) return;
+  try{
+    const r=await fetch('/api/auth/me',{headers:{'Authorization':'Bearer '+token}});
+    if(!r.ok){ localStorage.removeItem('cz_token'); return; }
+    const j=await r.json();
+    document.getElementById('body').className='bg-[#09090b] text-white min-h-screen p-6';
+    document.getElementById('body').innerHTML='<div class=\\'max-w-5xl mx-auto\\'><div class=\\'flex justify-between items-center mb-6\\'><h1 class=\\'text-2xl font-bold\\'>CIUZE LOG • Dashboard</h1><div class=\\'flex gap-2 items-center\\'><span class=\\'text-xs text-zinc-400\\'>'+j.user.email+'</span><button onclick=\\'localStorage.clear();location.reload()\\' class=\\'bg-zinc-800 rounded-xl px-3 py-1 text-xs\\'>Sair</button></div></div><div id=\\'dash\\' class=\\'grid grid-cols-3 gap-4\\'></div><div class=\\'mt-6 bg-[#0f0f10] border border-zinc-800 rounded-2xl p-5\\'><h2 class=\\'font-bold mb-3\\'>Upload de Tabela</h2><div class=\\'flex gap-2\\'><input id=\\'transp\\' placeholder=\\'Ex: JADLOG\\' class=\\'bg-black border border-zinc-800 rounded-xl px-3 py-2 text-sm\\'><input id=\\'file\\' type=\\'file\\' accept=\\'.xlsx,.xls\\' class=\\'text-xs\\'><button onclick=\\'upload()\\' class=\\'bg-amber-400 text-black rounded-xl px-4 py-2 text-sm font-bold\\'>Enviar</button></div><div id=\\'upRes\\' class=\\'text-xs mt-2 text-zinc-400\\'></div></div></div>';
+    const d=await fetch('/api/dashboard',{headers:{'Authorization':'Bearer '+token}}).then(r=>r.json());
+    document.getElementById('dash').innerHTML='<div class=\\'bg-[#0f0f10] border border-zinc-800 rounded-2xl p-5\\'><div class=\\'text-xs text-zinc-500\\'>Total Regras</div><div class=\\'text-2xl font-bold\\'>'+(d.total_regras||0)+'</div></div><div class=\\'bg-[#0f0f10] border border-zinc-800 rounded-2xl p-5\\'><div class=\\'text-xs text-zinc-500\\'>Transportadoras</div><div class=\\'text-2xl font-bold\\'>'+(d.transportadoras||0)+'</div></div><div class=\\'bg-[#0f0f10] border border-zinc-800 rounded-2xl p-5\\'><div class=\\'text-xs text-zinc-500\\'>Status</div><div class=\\'text-sm font-bold text-emerald-400\\'>Online • Fix OK</div></div>';
+  }catch{}
+})();
+async function upload(){
+  const token=localStorage.getItem('cz_token');
+  const transp=document.getElementById('transp').value.trim().toUpperCase();
+  const file=document.getElementById('file').files[0];
+  if(!transp||!file){ alert('Informe transportadora e arquivo'); return; }
+  const fd=new FormData(); fd.append('file',file);
+  document.getElementById('upRes').textContent='Enviando...';
+  const r=await fetch('/api/upload',{method:'POST',headers:{'Authorization':'Bearer '+token,'x-transportadora':transp},body:fd});
+  const j=await r.json();
+  document.getElementById('upRes').textContent= r.ok? 'OK: '+j.total+' linhas importadas para '+j.transportadora : 'Erro: '+(j.erro||'falha');
+}
+</script></body></html>`);
 });
 
 app.setNotFoundHandler((req,reply)=>{
@@ -181,4 +237,4 @@ app.setNotFoundHandler((req,reply)=>{
 });
 
 const port=process.env.PORT||3000;
-try{ await app.listen({ port, host:'0.0.0.0' }); console.log('🚀 CIUZE LOG V6 CORRIGIDO na porta '+port); }catch(e){ console.error(e); process.exit(1); }
+try{ await app.listen({ port, host:'0.0.0.0' }); console.log('🚀 CIUZE LOG V6.1 FIX na porta '+port); }catch(e){ console.error(e); process.exit(1); }
