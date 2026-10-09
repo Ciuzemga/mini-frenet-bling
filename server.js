@@ -3,6 +3,7 @@ import cors from '@fastify/cors';
 import multipart from '@fastify/multipart';
 import pg from 'pg';
 import 'dotenv/config';
+import XLSX from 'xlsx';
 
 const app = Fastify({ logger: true });
 await app.register(cors, { origin: '*' });
@@ -74,7 +75,72 @@ async function initDB(){
 }
 await initDB();
 
-function parseTabela(html){
+function normKey(k){
+  return String(k).toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g,'').replace(/[^a-z0-9]+/g,' ').trim();
+}
+
+function parseTabelaFromRows(rows){
+  // rows = array de objetos com chaves normalizadas variadas (XLSX, CSV)
+  const data=[];
+  for(const r of rows){
+    const get = (...names)=>{
+      for(const n of names){
+        const nk=normKey(n);
+        for(const key of Object.keys(r)){
+          if(normKey(key)===nk || normKey(key).includes(nk)){
+            const v=r[key];
+            if(v!=='' && v!=null) return v;
+          }
+        }
+      }
+      return 0;
+    };
+    const cep_ini = parseInt(String(get('cep inicial','cep ini','cep_ini','cep inicio')).replace(/\D/g,''))||0;
+    const cep_fim = parseInt(String(get('cep final','cep fim','cep_fim')).replace(/\D/g,''))||99999999;
+    if(cep_ini===0 && cep_fim===99999999) continue;
+    // Se planilha não tem transportadora, usa CIUZE
+    const transportadora = (r['transportadora'] || r['Transportadora'] || r['TRANSPORTADORA'] || 'CIUZE').toString().trim() || 'CIUZE';
+    const metodo = (r['metodo']||r['Metodo']||r['Formula']||r['formula']||'Frete Peso').toString().trim() || 'Frete Peso';
+
+    data.push({
+      transportadora,
+      metodo,
+      cep_ini,
+      cep_fim,
+      peso_ini: parseFloat(String(get('peso inicial','peso ini','peso_inicial')).replace(',','.'))||0,
+      peso_fim: parseFloat(String(get('peso final','peso_fim','peso final kg')).replace(',','.'))||999,
+      valor_ini: parseFloat(String(get('valor inicial','valor ini','valor inicial r$')).replace(',','.'))||0,
+      valor_fim: parseFloat(String(get('valor final','valor fim','valor final r$')).replace(',','.'))||9999999,
+      cubagem: parseFloat(String(get('cubagem','fator cubagem')).replace(',','.'))||300,
+      limite_peso: parseFloat(String(get('limite peso','limite peso kg')).replace(',','.'))||5000,
+      prazo: parseInt(String(get('prazo entrega','prazo','prazo dias')))||5,
+      frete_valor: parseFloat(String(get('frete valor','frete valor r$','frete')).replace(',','.'))||0,
+      excedente: parseFloat(String(get('excedente','excedente r$')).replace(',','.'))||0,
+      advalor_perc: parseFloat(String(get('advalor %','advalor','ad valorem')).replace(',','.'))||0,
+      peso_excedente: parseFloat(String(get('peso excedente','fracao taxa peso')).replace(',','.'))||0,
+      valor_por_kg: parseFloat(String(get('valor por kg','valor por kg r$','valor por kg')).replace(',','.'))||0,
+      despacho: parseFloat(String(get('despacho','despacho r$')).replace(',','.'))||0,
+      total_minimo: parseFloat(String(get('total minimo','total minimo r$')).replace(',','.'))||0,
+      imposto_perc: parseFloat(String(get('imposto %','imposto')).replace(',','.'))||0,
+      seguro_perc: parseFloat(String(get('seguro %','seguro perc')).replace(',','.'))||0,
+      seguro_min: parseFloat(String(get('seguro minimo','seguro min')).replace(',','.'))||0,
+      gris_perc: parseFloat(String(get('gris %','gris')).replace(',','.'))||0,
+      gris_min: parseFloat(String(get('gris minimo','gris min')).replace(',','.'))||0,
+      pedagio: parseFloat(String(get('pedagio r$','pedagio')).replace(',','.'))||0,
+      pedagio_fracao: parseFloat(String(get('pedagio fracao','pedagio fração')).replace(',','.'))||0,
+      tas_perc: parseFloat(String(get('tas %','tas perc')).replace(',','.'))||0,
+      tas_min: parseFloat(String(get('tas minimo','tas min')).replace(',','.'))||0,
+      emex_perc: parseFloat(String(get('emex %','emex perc')).replace(',','.'))||0,
+      emex_min: parseFloat(String(get('emex minimo','emex min')).replace(',','.'))||0,
+      taxa_min: parseFloat(String(get('taxa minima','taxa min')).replace(',','.'))||0,
+      taxa_max: parseFloat(String(get('taxa maxima','taxa max')).replace(',','.'))||0,
+      taxa_perc: parseFloat(String(get('taxa %','taxa perc')).replace(',','.'))||0,
+    });
+  }
+  return data;
+}
+
+function parseTabelaHTML(html){
   const rowRegex = /<tr[^>]*>(.*?)<\/tr>/gis;
   const colRegex = /<t[dh][^>]*>(.*?)<\/t[dh]>/gis;
   const rows = [...html.matchAll(rowRegex)].map(m=>m[1]);
@@ -119,6 +185,48 @@ function parseTabela(html){
     });
   }
   return data;
+}
+
+function parseTabelaXLSX(buffer){
+  const wb = XLSX.read(buffer, {type:'buffer'});
+  const firstSheet = wb.SheetNames[0];
+  const ws = wb.Sheets[firstSheet];
+  const json = XLSX.utils.sheet_to_json(ws, {defval:0});
+  if(json.length===0) return [];
+  return parseTabelaFromRows(json);
+}
+
+function parseTabela(buffer, filename=''){
+  const name = (filename||'').toLowerCase();
+  const isXlsx = name.endsWith('.xlsx') || name.endsWith('.xls') && buffer.slice(0,2).toString() !== '<';
+  // Detecta por conteúdo: XLSX começa com PK
+  const isZip = buffer[0]===0x50 && buffer[1]===0x4B;
+  if(isXlsx || isZip){
+    try{
+      const d = parseTabelaXLSX(buffer);
+      if(d.length>0) return d;
+    }catch(e){ console.log('Falha parse XLSX, tentando HTML:', e.message); }
+  }
+  // Tenta HTML
+  const html = buffer.toString('utf-8');
+  if(html.includes('<tr') || html.includes('<TR')){
+    return parseTabelaHTML(html);
+  }
+  // Tenta CSV
+  if(html.includes(';') || html.includes(',')){
+    const lines = html.split(/\r?\n/).filter(l=>l.trim());
+    if(lines.length>1){
+      const headers = lines[0].split(/;|,/).map(h=>h.trim());
+      const rows = lines.slice(1).map(l=>{
+        const vals = l.split(/;|,/);
+        const obj={};
+        headers.forEach((h,i)=>obj[h]=vals[i]);
+        return obj;
+      });
+      return parseTabelaFromRows(rows);
+    }
+  }
+  return [];
 }
 
 function toNum(v){
@@ -252,10 +360,10 @@ app.post('/api/upload', async (req, reply)=>{
     return reply.code(400).send({ erro: 'arquivo ausente. Envie como multipart field file' });
   }
   const buffer = await file.toBuffer();
-  const html = buffer.toString('utf-8');
-  const parsed = parseTabela(html);
+  const filename = file.filename || '';
+  const parsed = parseTabela(buffer, filename);
   if(parsed.length === 0){
-    return reply.code(400).send({ erro: 'Nenhuma linha valida encontrada. Verifique se a planilha tem dados no tbody' });
+    return reply.code(400).send({ erro: 'Nenhuma linha valida encontrada. Verifique se a planilha tem dados. Formatos aceitos: .xlsx, .xls, .html, .htm (exportado como HTML)' });
   }
   if(pool){
     let client;
@@ -357,9 +465,9 @@ app.get('/painel', async (req, reply)=>{
       <div id="dropZone" class="border-2 border-dashed border-zinc-700 rounded-2xl p-8 text-center hover:border-violet-500/50 transition cursor-pointer bg-zinc-800/30">
         <div class="text-3xl mb-2">📄</div>
         <p class="text-sm font-medium">Arraste a planilha aqui</p>
-        <p class="text-xs text-zinc-500 mt-1">Planilha exportada como HTML (.html, .htm ou .xls exportado como HTML)</p>
+        <p class="text-xs text-zinc-500 mt-1">Planilha .xlsx, .xls ou exportada como HTML (.html, .htm)</p>
         <p class="text-xs text-zinc-600 mt-3">ou clique para selecionar</p>
-        <input id="fileInput" type="file" accept=".html,.htm,.xls" class="hidden">
+        <input id="fileInput" type="file" accept=".xlsx,.xls,.html,.htm" class="hidden">
       </div>
       <div id="uploadProgress" class="hidden mt-4"><div class="h-2 bg-zinc-800 rounded-full overflow-hidden"><div id="progressBar" class="h-full bg-violet-500 transition-all" style="width:0%"></div></div><p id="progressText" class="text-xs text-zinc-400 mt-2"></p></div>
       <div id="uploadResult" class="hidden mt-4 p-4 rounded-xl text-sm"></div>
