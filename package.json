@@ -1,6 +1,6 @@
 {
-  "name": "ciuzelog-v4-frenet-fiel",
-  "version": "4.0.0-profissional-fiel",
+  "name": "ciuzelog-v5-final-fiel",
+  "version": "5.0.0-final-profissional-fiel",
   "type": "module",
   "main": "server.js",
   "scripts": {
@@ -12,7 +12,6 @@
     "@fastify/multipart": "^8.3.0",
     "pg": "^8.11.3",
     "dotenv": "^16.4.5",
-    "bcryptjs": "^2.4.3",
     "xlsx": "^0.18.5"
   },
   "engines": {
