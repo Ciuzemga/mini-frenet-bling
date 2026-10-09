@@ -1,4 +1,8 @@
 {
+  "name": "mini-frenet-bling",
+  "type": "module",
+  "main": "server.js",
+  "scripts": { "start": "node server.js" },
   "dependencies": {
     "fastify": "^4.28.0",
     "@fastify/cors": "^9.0.1",
