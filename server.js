@@ -316,4 +316,3 @@ app.setNotFoundHandler((req,reply)=>{
 
 const port=process.env.PORT||3000;
 app.listen({ port, host:'0.0.0.0' }, ()=>{ console.log(`🚀 CIUZE LOG PROFISSIONAL v1 na porta ${port} - 100% profissional, sem amadorismo, todos os links funcionais`); });
-
