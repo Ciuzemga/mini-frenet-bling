@@ -52,9 +52,6 @@ async function initDB(){
       console.log('🔐 Admin ATUALIZADO', adminEmail);
     }
     await pool.query(`UPDATE colaboradores SET tentativas_login=0, bloqueado_ate=NULL WHERE email=$1`,[adminEmail]);
-    // patch closed
-      console.log('🔐 Admin criado:', process.env.ADMIN_EMAIL||'admin@ciuzelog.com');
-    }
     DB_READY=true; console.log('✅ DB pronto');
   }catch(e){ console.error('⚠️ initDB falhou:', e.message); setTimeout(initDB, 5000); }
 }
